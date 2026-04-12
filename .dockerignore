@@ -1,0 +1,8 @@
+.git
+.env
+.env.local
+data/
+__pycache__/
+*.py[cod]
+.DS_Store
+ollama/

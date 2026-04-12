@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<!-- @ai-context Single-page Hermes admin UI with accessible form controls. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Hermes Control Room</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}" />
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  </head>
+  <body>
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <h1 id="page-title">Hermes Control Room</h1>
+        <p class="lede">
+          Keep Railway, local compose, and Hermes itself aligned from one admin
+          screen. Saved file values win over runtime defaults, and gateway
+          starts remain explicit unless boot-time auto-start is enabled.
+        </p>
+      </section>
+
+      <div class="grid">
+        <section class="panel" aria-labelledby="config-title">
+          <h2 id="config-title">Inference Setup</h2>
+          <form id="config-form">
+            <div class="field-row">
+              <div class="field">
+                <label for="provider">Inference provider</label>
+                <select id="provider" name="provider" aria-required="true">
+                  {% for value, label in provider_options %}
+                  <option value="{{ value }}">{{ label }}</option>
+                  {% endfor %}
+                </select>
+                <p class="hint">
+                  OpenRouter and custom OpenAI-compatible endpoints are managed
+                  directly here. Other providers can keep using matching keys you
+                  already store in Hermes <code>.env</code>.
+                </p>
+              </div>
+
+              <div class="field">
+                <label for="default-model">Default model</label>
+                <input
+                  id="default-model"
+                  name="default_model"
+                  type="text"
+                  autocomplete="off"
+                  placeholder="llama3.2 or openai/gpt-5-mini"
+                  aria-required="true"
+                />
+                <p class="hint">This is written to <code>config.yaml</code>.</p>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="ollama-base-url">Ollama base URL</label>
+              <input
+                id="ollama-base-url"
+                name="ollama_base_url"
+                type="text"
+                autocomplete="off"
+                placeholder="http://ollama:11434"
+                aria-describedby="ollama-hint"
+              />
+              <p id="ollama-hint" class="hint">
+                Local compose: {{ local_ollama_hint }}. Railway private network:
+                {{ railway_ollama_hint }}. Hermes will normalize this to a
+                <code>/v1</code> endpoint.
+              </p>
+              <div class="connection-test">
+                <button class="secondary" type="button" id="test-connection">
+                  Test Connection
+                </button>
+                <div id="connection-result" role="status" aria-live="polite"></div>
+              </div>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="ollama-api-key">Optional Ollama API key</label>
+                <input
+                  id="ollama-api-key"
+                  name="ollama_api_key"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="Leave blank for self-hosted Ollama"
+                />
+                <p class="hint">
+                  Saved into Hermes <code>.env</code>. Used only when your custom
+                  endpoint requires authentication.
+                </p>
+              </div>
+
+              <div class="field">
+                <label for="openrouter-api-key">OpenRouter API key</label>
+                <input
+                  id="openrouter-api-key"
+                  name="openrouter_api_key"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="Required for provider=openrouter"
+                />
+                <p class="hint">
+                  Saved into Hermes <code>.env</code> as
+                  <code>OPENROUTER_API_KEY</code>.
+                </p>
+              </div>
+            </div>
+
+            <div class="buttons">
+              <button class="primary" type="submit">Save Config</button>
+              <button class="secondary" type="button" id="save-restart">
+                Save and Restart Gateway
+              </button>
+            </div>
+            <p class="hint">
+              Saving keeps the current gateway state. Use restart or start only
+              when you want the running process to change.
+            </p>
+          </form>
+        </section>
+
+        <aside class="panel" aria-labelledby="status-title">
+          <h2 id="status-title">Gateway State</h2>
+          <div id="gateway-pill" class="pill warn" role="status" aria-live="polite">
+            Waiting for status
+          </div>
+          <dl class="summary-list">
+            <dt>Provider</dt>
+            <dd id="summary-provider">-</dd>
+            <dt>Active endpoint</dt>
+            <dd id="summary-endpoint">-</dd>
+            <dt>Ollama configured</dt>
+            <dd id="summary-ollama">-</dd>
+            <dt>Config ready</dt>
+            <dd id="summary-ready">-</dd>
+            <dt>Gateway PID</dt>
+            <dd id="summary-pid">-</dd>
+          </dl>
+
+          <div class="checklist" aria-labelledby="checklist-title">
+            <h3 id="checklist-title">Setup Checklist</h3>
+            <ul class="check-items">
+              <li id="check-provider" class="check-item pending">Provider selected</li>
+              <li id="check-model" class="check-item pending">Model configured</li>
+              <li id="check-endpoint" class="check-item pending">Endpoint configured</li>
+              <li id="check-connection" class="check-item pending">Connection verified</li>
+              <li id="check-gateway" class="check-item pending">Gateway running</li>
+            </ul>
+          </div>
+
+          <div class="status-actions">
+            <button class="secondary" type="button" id="refresh-status">
+              Refresh
+            </button>
+            <button class="secondary" type="button" id="start-gateway">
+              Start Gateway
+            </button>
+            <button class="secondary" type="button" id="restart-gateway">
+              Restart Gateway
+            </button>
+            <button class="danger" type="button" id="stop-gateway">
+              Stop Gateway
+            </button>
+          </div>
+
+          <p id="status-message" role="status" aria-live="polite"></p>
+        </aside>
+      </div>
+
+      <section class="panel logs" aria-labelledby="logs-title">
+        <h2 id="logs-title">Recent Gateway Logs</h2>
+        <pre id="gateway-logs">No logs captured yet.</pre>
+      </section>
+    </main>
+  </body>
+</html>

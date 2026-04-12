@@ -1,0 +1,17 @@
+# Local environment files
+.env
+.env.local
+
+# Python cache and virtualenvs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Local data mounts
+data/
