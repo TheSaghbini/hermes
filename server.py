@@ -53,6 +53,7 @@ GENERATED_PASSWORD = secrets.token_urlsafe(18)
 LOCAL_TEST_ONLY_ADMIN_PASSWORD = "local-test-only-change-this-password"
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", GENERATED_PASSWORD)
+TRUSTED_ORIGIN = os.getenv("TRUSTED_ORIGIN", "").strip()
 AUTO_START = os.getenv("HERMES_AUTO_START", "true").strip().lower() not in {
     "0",
     "false",
@@ -130,7 +131,12 @@ def require_same_origin_json_write() -> Response | None:
         "Referer", ""
     ).strip()
     source_origin = normalized_origin(source)
-    target_origin = normalized_origin(request.host_url)
+    target_origin = normalized_origin(
+        TRUSTED_ORIGIN if TRUSTED_ORIGIN else request.host_url
+    )
+    LOGGER.debug(
+        "CSRF check: source_origin=%r target_origin=%r", source_origin, target_origin
+    )
     if not source_origin or not target_origin:
         return json_error(
             "State-changing routes require a same-origin browser request.",
