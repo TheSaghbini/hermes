@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -19,6 +20,72 @@ from typing import Any
 from hermes_config import HERMES_HOME, LOG_PATH
 
 LOGGER = logging.getLogger("hermes-admin.gateway")
+
+
+class GatewayWatchdog:
+    """Daemon thread that auto-restarts the gateway when it crashes."""
+
+    def __init__(self, manager: GatewayManager) -> None:
+        self._manager = manager
+        self._consecutive_failures = 0
+        self._last_restart_at = 0.0
+        self._running_since = 0.0
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="gateway-watchdog",
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def reset_failures(self) -> None:
+        """Reset failure counter (called on manual start/restart)."""
+        self._consecutive_failures = 0
+        self._running_since = time.time()
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(2)
+            try:
+                self._check()
+            except Exception:
+                LOGGER.exception("Watchdog check failed")
+
+    def _check(self) -> None:
+        # Lazy import to avoid circular import at module level
+        from database import get_watchdog_config
+
+        policy = get_watchdog_config()
+        if not policy["enabled"]:
+            self._consecutive_failures = 0
+            return
+
+        # If gateway is running, check if cooldown period reached to reset failures
+        if self._manager.is_running():
+            if self._running_since and (time.time() - self._running_since) > policy["cooldown_seconds"]:
+                self._consecutive_failures = 0
+            return
+
+        # Gateway is NOT running — should we restart?
+        if self._consecutive_failures >= policy["max_retries"]:
+            return  # exhausted
+
+        elapsed = time.time() - self._last_restart_at
+        backoff = min(
+            policy["backoff_base_seconds"] * (2 ** self._consecutive_failures),
+            policy["backoff_max_seconds"],
+        )
+        if elapsed < backoff:
+            return  # waiting for backoff
+
+        # Do the restart
+        self._consecutive_failures += 1
+        self._last_restart_at = time.time()
+        LOGGER.warning(
+            "Watchdog auto-restarting gateway (attempt %d/%d)",
+            self._consecutive_failures, policy["max_retries"],
+        )
+        self._manager.start()
+        self._running_since = time.time()
 
 
 class GatewayManager:
@@ -31,6 +98,9 @@ class GatewayManager:
         self._last_exit_code: int | None = None
         self._last_error = ""
         self._logs: deque[str] = deque(maxlen=200)
+        self._log_subscribers: list[queue.Queue] = []
+        self._subscriber_lock = threading.Lock()
+        self.watchdog = GatewayWatchdog(self)
 
     def start(self) -> dict[str, Any]:
         """Launch the gateway if it is not already running."""
@@ -65,6 +135,7 @@ class GatewayManager:
                 daemon=True,
             ).start()
             self._append_log("Hermes gateway process started.")
+            self.watchdog.reset_failures()
             return self.status()
 
     def stop(self) -> dict[str, Any]:
@@ -144,7 +215,32 @@ class GatewayManager:
             if process.returncode not in (None, 0):
                 self._last_error = f"Gateway exited with code {process.returncode}."
 
+    def subscribe_logs(self) -> queue.Queue:
+        """Create a new log subscriber queue for SSE streaming."""
+        q: queue.Queue = queue.Queue(maxsize=100)
+        with self._subscriber_lock:
+            self._log_subscribers.append(q)
+        return q
+
+    def unsubscribe_logs(self, q: queue.Queue) -> None:
+        """Remove a log subscriber queue."""
+        with self._subscriber_lock:
+            try:
+                self._log_subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def start_watchdog(self) -> None:
+        """Start the watchdog daemon thread (call after DB init)."""
+        self.watchdog.start()
+
     def _append_log(self, message: str) -> None:
-        """Store a recent log line for API consumers."""
+        """Store a recent log line and broadcast to subscribers."""
         with self._lock:
             self._logs.append(message)
+        with self._subscriber_lock:
+            for q in self._log_subscribers:
+                try:
+                    q.put_nowait(message)
+                except queue.Full:
+                    pass  # drop for slow consumers

@@ -22,24 +22,56 @@ from dataclasses import asdict
 from typing import Any
 from urllib.parse import urlsplit
 
-from flask import Flask, Response, jsonify, render_template, request
+import queue
+import re
+from pathlib import Path
+
+import yaml
+from flask import Flask, Response, jsonify, render_template, request, send_file, send_from_directory
 from waitress import serve
 from werkzeug.exceptions import BadRequest
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from gateway_manager import GatewayManager
 from hermes_config import (
+    CONFIG_PATH,
     DEFAULT_OPENROUTER_BASE_URL,
+    ENV_PATH,
     LOCAL_OLLAMA_HINT,
+    PROVIDER_ENV_REQUIREMENTS,
     PROVIDER_OPTIONS,
     RAILWAY_OLLAMA_HINT,
     ensure_runtime_home,
     is_inference_ready,
     load_settings,
     normalize_provider,
+    read_env_file,
     save_settings,
     seed_files_from_env,
+    write_env_file,
 )
+from database import (
+    add_message,
+    close_db,
+    create_conversation,
+    delete_conversation,
+    get_conversation,
+    get_messages,
+    get_watchdog_config,
+    init_db,
+    list_conversations,
+    set_watchdog_config,
+    update_conversation,
+)
+from backup_manager import (
+    create_backup,
+    delete_backup,
+    download_backup,
+    get_backup,
+    list_backups,
+    restore_backup,
+)
+from chat_proxy import resolve_provider, stream_chat
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +91,10 @@ AUTO_START = os.getenv("HERMES_AUTO_START", "true").strip().lower() not in {
     "false",
     "no",
 }
+FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
+USE_LEGACY_UI = os.getenv("USE_LEGACY_UI", "false").strip().lower() in {"1", "true", "yes"}
 SECRET_UNCHANGED_PREFIX = "\u2022\u2022\u2022\u2022"
+_SECRET_KEY_PATTERN = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD)", re.IGNORECASE)
 STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
@@ -212,8 +247,10 @@ def add_no_store_headers(response: Response) -> Response:
 
 
 @APP.get("/")
-def index() -> str:
-    """Render the single-page admin UI."""
+def index() -> str | Response:
+    """Serve the React SPA or fall back to the legacy Jinja2 admin UI."""
+    if not USE_LEGACY_UI and (FRONTEND_DIR / "index.html").is_file():
+        return send_from_directory(FRONTEND_DIR, "index.html")
     return render_template(
         "index.html",
         provider_options=PROVIDER_OPTIONS,
@@ -276,9 +313,9 @@ def api_gateway(action: str) -> Response:
     }
     handler = handlers.get(action)
     if not handler:
-        return jsonify({"error": "Unsupported action."}), 404
+        return json_error("Unsupported action.", 404)
     if action in {"start", "restart"} and not is_inference_ready(load_settings()):
-        return jsonify({"error": "Inference config is not complete enough to start."}), 400
+        return json_error("Inference config is not complete enough to start.", 400)
     handler()
     return jsonify(status_payload())
 
@@ -387,10 +424,437 @@ def api_test_connection() -> Response:
     })
 
 
+# ---------------------------------------------------------------------------
+# Chat routes
+# ---------------------------------------------------------------------------
+
+
+@APP.post("/api/chat")
+def api_chat() -> Response:
+    """@ai-context Streaming SSE chat endpoint.
+
+    Parse JSON body, persist user message, stream provider response, and
+    persist the assistant reply on completion.
+    """
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    if payload is None:
+        return json_error("Empty payload.", 400)
+
+    conversation_id = payload.get("conversation_id")
+    message = (payload.get("message") or "").strip()
+    model_override = (payload.get("model") or "").strip()
+    system_prompt = (payload.get("system_prompt") or "").strip()
+
+    if not conversation_id or not message:
+        return json_error("conversation_id and message are required.", 400)
+
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        return json_error("Conversation not found.", 404)
+
+    settings = load_settings()
+    model = model_override or conversation.get("model") or settings.default_model
+    if not model:
+        return json_error("No model configured.", 400)
+
+    # Persist user message
+    add_message(conversation_id, "user", message)
+
+    # Build message history
+    history = get_messages(conversation_id)
+    messages: list[dict] = []
+    effective_system = system_prompt or conversation.get("system_prompt", "")
+    if effective_system:
+        messages.append({"role": "system", "content": effective_system})
+    for msg in history:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    base_url, api_key = resolve_provider(settings)
+    if not base_url:
+        return json_error("No provider base URL configured.", 400)
+
+    def generate():  # type: ignore[no-untyped-def]
+        accumulated: list[str] = []
+        try:
+            gen = stream_chat(base_url, api_key, model, messages)
+            for event in gen:
+                yield event
+                # Extract content from delta events for accumulation
+                if event.startswith("event: delta"):
+                    lines = event.strip().split("\n")
+                    for line in lines:
+                        if line.startswith("data: "):
+                            try:
+                                data = _json.loads(line[6:])
+                                if "content" in data:
+                                    accumulated.append(data["content"])
+                            except _json.JSONDecodeError:
+                                pass
+        except GeneratorExit:
+            return
+        finally:
+            # Persist assistant message with accumulated content
+            full_content = "".join(accumulated)
+            if full_content:
+                add_message(conversation_id, "assistant", full_content, model=model)
+
+    return Response(
+        generate(),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@APP.get("/api/conversations")
+def api_list_conversations() -> Response:
+    """@ai-context List conversations with pagination."""
+    limit = request.args.get("limit", 50, type=int)
+    offset = request.args.get("offset", 0, type=int)
+    return jsonify({"conversations": list_conversations(limit, offset)})
+
+
+@APP.get("/api/conversations/<conversation_id>")
+def api_get_conversation(conversation_id: str) -> Response:
+    """@ai-context Return a single conversation with all its messages."""
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        return json_error("Conversation not found.", 404)
+    conversation["messages"] = get_messages(conversation_id)
+    return jsonify(conversation)
+
+
+@APP.post("/api/conversations")
+def api_create_conversation() -> Response:
+    """@ai-context Create a new conversation."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    settings = load_settings()
+    title = (payload or {}).get("title", "New Conversation")
+    model = (payload or {}).get("model") or settings.default_model or ""
+    system_prompt = (payload or {}).get("system_prompt", "")
+    conversation = create_conversation(title, model, system_prompt)
+    return jsonify(conversation), 201
+
+
+@APP.delete("/api/conversations/<conversation_id>")
+def api_delete_conversation(conversation_id: str) -> Response:
+    """@ai-context Delete a conversation and its messages."""
+    if get_conversation(conversation_id) is None:
+        return json_error("Conversation not found.", 404)
+    delete_conversation(conversation_id)
+    return jsonify({"ok": True})
+
+
+@APP.patch("/api/conversations/<conversation_id>")
+def api_update_conversation(conversation_id: str) -> Response:
+    """@ai-context Rename a conversation."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    title = (payload or {}).get("title", "").strip()
+    if not title:
+        return json_error("title is required.", 400)
+    if get_conversation(conversation_id) is None:
+        return json_error("Conversation not found.", 404)
+    conversation = update_conversation(conversation_id, title)
+    return jsonify(conversation)
+
+
+# ---------------------------------------------------------------------------
+# Extended config routes
+# ---------------------------------------------------------------------------
+
+
+@APP.get("/api/config/yaml")
+def api_get_config_yaml() -> Response:
+    """@ai-context Return raw config.yaml content."""
+    if not CONFIG_PATH.exists():
+        return jsonify({"content": ""})
+    return jsonify({"content": CONFIG_PATH.read_text(encoding="utf-8")})
+
+
+@APP.put("/api/config/yaml")
+def api_put_config_yaml() -> Response:
+    """@ai-context Validate and write raw config.yaml."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    content = (payload or {}).get("content", "")
+    if not isinstance(content, str):
+        return json_error("content must be a string.", 400)
+    try:
+        yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        return json_error(f"Invalid YAML: {exc}", 400)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+    return jsonify({"ok": True})
+
+
+@APP.get("/api/config/env")
+def api_get_config_env() -> Response:
+    """@ai-context Return .env entries with secrets masked."""
+    env_values = read_env_file()
+    entries = []
+    for key, value in sorted(env_values.items()):
+        masked = bool(_SECRET_KEY_PATTERN.search(key))
+        entries.append({
+            "key": key,
+            "value": mask_secret(value) if masked else value,
+            "masked": masked,
+        })
+    return jsonify({"entries": entries})
+
+
+@APP.put("/api/config/env")
+def api_put_config_env() -> Response:
+    """@ai-context Write .env entries."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    raw_entries = (payload or {}).get("entries")
+    if not isinstance(raw_entries, list):
+        return json_error("entries must be a list.", 400)
+
+    current_env = read_env_file()
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key", "")).strip()
+        value = str(entry.get("value", "")).strip()
+        if not key:
+            continue
+        # Skip masked-unchanged values
+        if value.startswith(SECRET_UNCHANGED_PREFIX):
+            continue
+        current_env[key] = value
+
+    write_env_file(ENV_PATH, current_env)
+    return jsonify({"ok": True})
+
+
+@APP.get("/api/models")
+def api_models() -> Response:
+    """@ai-context Query models from the active provider."""
+    settings = load_settings()
+    provider = normalize_provider(settings.provider)
+
+    if provider == "custom":
+        base = settings.ollama_base_url.rstrip("/")
+        if not base:
+            return jsonify({"models": []})
+        probe_url = f"{base}/v1/models" if "/v1" not in base else f"{base}/models"
+        result = _probe_endpoint(probe_url, settings.ollama_api_key or None)
+    elif provider == "openrouter":
+        if not settings.openrouter_api_key:
+            return jsonify({"models": []})
+        probe_url = f"{DEFAULT_OPENROUTER_BASE_URL}/models"
+        result = _probe_endpoint(probe_url, settings.openrouter_api_key)
+    else:
+        return jsonify({"models": []})
+
+    models = [{"id": m} for m in result.get("models", [])]
+    return jsonify({"models": models})
+
+
+@APP.get("/api/providers")
+def api_providers() -> Response:
+    """@ai-context Return available providers with configured status."""
+    settings = load_settings()
+    env_values = read_env_file()
+    providers = []
+    for pid, label in PROVIDER_OPTIONS:
+        configured = False
+        if pid == "custom":
+            configured = bool(settings.ollama_base_url)
+        elif pid == "openrouter":
+            configured = bool(settings.openrouter_api_key)
+        elif pid == "auto":
+            configured = bool(settings.ollama_base_url or settings.openrouter_api_key)
+        else:
+            required = PROVIDER_ENV_REQUIREMENTS.get(pid, ())
+            configured = any(env_values.get(k) or os.getenv(k) for k in required)
+        providers.append({"id": pid, "label": label, "configured": configured})
+    return jsonify({"providers": providers})
+
+
+# ---------------------------------------------------------------------------
+# Backup routes
+# ---------------------------------------------------------------------------
+
+
+@APP.get("/api/backups")
+def api_list_backups() -> Response:
+    """@ai-context List all backups."""
+    return jsonify({"backups": list_backups()})
+
+
+@APP.post("/api/backups")
+def api_create_backup() -> Response:
+    """@ai-context Create a backup snapshot."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    label = (payload or {}).get("label", "")
+    backup = create_backup(label)
+    return jsonify(backup), 201
+
+
+@APP.post("/api/backups/<backup_id>/restore")
+def api_restore_backup(backup_id: str) -> Response:
+    """@ai-context Restore a backup and optionally restart the gateway."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+
+    meta = get_backup(backup_id)
+    if meta is None:
+        return json_error("Backup not found.", 404)
+
+    close_db()
+    try:
+        restored = restore_backup(backup_id)
+    except FileNotFoundError:
+        return json_error("Backup not found.", 404)
+    finally:
+        init_db()
+
+    restart_gateway = bool((payload or {}).get("restart_gateway"))
+    if restart_gateway:
+        GATEWAY.restart()
+
+    return jsonify({"ok": True, "restored": restored})
+
+
+@APP.delete("/api/backups/<backup_id>")
+def api_delete_backup(backup_id: str) -> Response:
+    """@ai-context Delete a backup."""
+    if get_backup(backup_id) is None:
+        return json_error("Backup not found.", 404)
+    try:
+        delete_backup(backup_id)
+    except ValueError:
+        return json_error("Invalid backup ID.", 400)
+    return jsonify({"ok": True})
+
+
+@APP.get("/api/backups/<backup_id>/download")
+def api_download_backup(backup_id: str) -> Response:
+    """@ai-context Stream a backup as a tar.gz download."""
+    if get_backup(backup_id) is None:
+        return json_error("Backup not found.", 404)
+    try:
+        archive_path = download_backup(backup_id)
+    except FileNotFoundError:
+        return json_error("Backup not found.", 404)
+    except ValueError:
+        return json_error("Invalid backup ID.", 400)
+    response = send_file(
+        archive_path,
+        mimetype="application/gzip",
+        as_attachment=True,
+        download_name=f"hermes-backup-{backup_id}.tar.gz",
+    )
+    response.call_on_close(lambda: os.unlink(archive_path))
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Log routes
+# ---------------------------------------------------------------------------
+
+
+@APP.get("/api/logs/stream")
+def api_logs_stream() -> Response:
+    """@ai-context SSE endpoint for live gateway log streaming."""
+    log_queue = GATEWAY.subscribe_logs()
+
+    def generate():  # type: ignore[no-untyped-def]
+        try:
+            while True:
+                try:
+                    line = log_queue.get(timeout=30)
+                    data = _json.dumps({"line": line, "level": "info"})
+                    yield f"event: log\ndata: {data}\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            GATEWAY.unsubscribe_logs(log_queue)
+
+    return Response(
+        generate(),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@APP.get("/api/logs/history")
+def api_logs_history() -> Response:
+    """@ai-context Return a snapshot of recent gateway log lines."""
+    logs = list(GATEWAY._logs)
+    return jsonify({"lines": logs, "total": len(logs)})
+
+
+# ---------------------------------------------------------------------------
+# Watchdog routes
+# ---------------------------------------------------------------------------
+
+
+@APP.get("/api/gateway/watchdog")
+def api_get_watchdog() -> Response:
+    """@ai-context Return the current watchdog auto-restart policy."""
+    return jsonify(get_watchdog_config())
+
+
+@APP.put("/api/gateway/watchdog")
+def api_put_watchdog() -> Response:
+    """@ai-context Update the watchdog auto-restart policy."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    if not payload:
+        return json_error("Empty payload.", 400)
+    try:
+        config = set_watchdog_config(**payload)
+    except (TypeError, ValueError):
+        return json_error("Invalid watchdog config values.", 400)
+    return jsonify(config)
+
+
+# ---------------------------------------------------------------------------
+# SPA catchall (must be registered LAST)
+# ---------------------------------------------------------------------------
+
+
+@APP.get("/<path:fallback>")
+def spa_fallback(fallback: str) -> Response:
+    """@ai-context Serve static assets from frontend/dist or index.html for client-side routing."""
+    if not USE_LEGACY_UI and FRONTEND_DIR.is_dir():
+        # Serve static assets (JS, CSS, images) if they exist on disk
+        candidate = FRONTEND_DIR / fallback
+        if candidate.is_file():
+            return send_from_directory(FRONTEND_DIR, fallback)
+        # Otherwise serve index.html for client-side routing
+        if (FRONTEND_DIR / "index.html").is_file():
+            return send_from_directory(FRONTEND_DIR, "index.html")
+    return json_error("Not found.", 404)
+
+
 def bootstrap() -> None:
     """Prepare the persistent Hermes home and optionally auto-start."""
     ensure_runtime_home()
     seed_files_from_env()
+    init_db()
+    GATEWAY.start_watchdog()
     if os.getenv("ADMIN_PASSWORD") is None:
         hint = ADMIN_PASSWORD[:4] + "…" + ADMIN_PASSWORD[-4:] if len(ADMIN_PASSWORD) > 8 else "****"
         LOGGER.warning(
