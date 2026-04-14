@@ -1,5 +1,7 @@
 /**
  * @ai-context Logs page combining historical log load with live SSE streaming.
+ * Dark terminal-style viewer (#1a1b26) with colored log levels, connection status,
+ * auto-scroll, filter, and clear controls.
  * @ai-related frontend/src/components/logs/LogStream.tsx, frontend/src/components/logs/LogControls.tsx
  */
 
@@ -17,6 +19,7 @@ export function LogsPage() {
   const [connected, setConnected] = useState(false);
   const controllerRef = useRef<AbortController | null>(null);
 
+  // Load historical logs on mount
   useEffect(() => {
     (async () => {
       try {
@@ -28,6 +31,7 @@ export function LogsPage() {
     })();
   }, []);
 
+  // Start SSE live log stream
   useEffect(() => {
     const controller = streamLogs(
       (line) => {
@@ -55,7 +59,7 @@ export function LogsPage() {
     <div className="logs-page">
       <Header title="Gateway Logs" />
 
-      <div className="panel">
+      <div className="logs-terminal">
         <LogControls
           autoScroll={autoScroll}
           onAutoScrollChange={setAutoScroll}
