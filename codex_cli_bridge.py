@@ -25,7 +25,6 @@ CODEX_CLI_BASE_URL = "cli://local/v1"
 DEFAULT_CODEX_CLI_BIN = "codex"
 DEFAULT_CODEX_APPROVAL_MODE = "never"
 DEFAULT_CODEX_SANDBOX = "read-only"
-STREAM_FLUSH_CHARS = 96
 
 
 def _merged_env(env_values: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -135,6 +134,7 @@ def _build_codex_cli_command(
     command = [
         resolve_codex_cli_binary(merged_env),
         "exec",
+        "--experimental-json",
         "--skip-git-repo-check",
         "--color",
         "never",
@@ -178,13 +178,93 @@ def _sse_event(event: str, payload: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
+def _parse_codex_cli_event(raw_line: str) -> dict[str, object] | None:
+    """Parse a single JSONL event emitted by `codex exec --experimental-json`."""
+    line = raw_line.strip()
+    if not line:
+        return None
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        LOGGER.debug("Ignoring non-JSON Codex CLI output: %s", line)
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _assistant_text_from_codex_event(event: Mapping[str, object]) -> str:
+    """Extract assistant text from a structured Codex item-completed event."""
+    if event.get("type") != "item.completed":
+        return ""
+
+    item = event.get("item")
+    if not isinstance(item, dict) or item.get("type") != "agent_message":
+        return ""
+
+    text = item.get("text")
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _error_text_from_codex_event(event: Mapping[str, object]) -> str:
+    """Extract a structured error message from a Codex JSONL event."""
+    event_type = event.get("type")
+    if event_type == "turn.failed":
+        error = event.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+
+    if event_type == "error":
+        message = event.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+    if event_type != "item.completed":
+        return ""
+
+    item = event.get("item")
+    if not isinstance(item, dict) or item.get("type") != "error":
+        return ""
+
+    message = item.get("message")
+    return message.strip() if isinstance(message, str) else ""
+
+
+def _clean_codex_cli_stderr(stderr_text: str) -> str:
+    """Remove known non-actionable Codex banner lines from stderr."""
+    ignored_prefixes = (
+        "Reading additional input from stdin",
+        "OpenAI Codex v",
+        "workdir:",
+        "model:",
+        "provider:",
+        "approval:",
+        "sandbox:",
+        "reasoning effort:",
+        "reasoning summaries:",
+        "session id:",
+        "warning: Codex could not find bubblewrap on PATH",
+        "Install bubblewrap with your OS package manager",
+    )
+    cleaned_lines = [
+        line.strip()
+        for line in stderr_text.splitlines()
+        if line.strip()
+        and line.strip() != "--------"
+        and not any(line.strip().startswith(prefix) for prefix in ignored_prefixes)
+    ]
+    return "\n".join(cleaned_lines).strip()
+
+
 def stream_codex_cli_chat(
     api_key: str | None,
     model: str,
     messages: list[dict],
     env_values: Mapping[str, str] | None = None,
 ) -> Generator[str, None, dict]:
-    """Run `codex exec` and translate stdout into Hermes SSE events."""
+    """Run `codex exec` and translate structured output into Hermes SSE events."""
     merged_env = _merged_env(env_values)
     if api_key and not merged_env.get("OPENAI_API_KEY", "").strip():
         merged_env["OPENAI_API_KEY"] = api_key
@@ -238,25 +318,29 @@ def stream_codex_cli_chat(
 
     try:
         assert process.stdout is not None
-        buffer = ""
+        structured_error = ""
         while True:
-            chunk = process.stdout.read(1)
-            if not chunk:
+            raw_line = process.stdout.readline()
+            if not raw_line:
                 break
-            buffer += chunk
-            if len(buffer) >= STREAM_FLUSH_CHARS or chunk == "\n":
-                accumulated.append(buffer)
-                yield _sse_event("delta", {"content": buffer})
-                buffer = ""
+            event = _parse_codex_cli_event(raw_line)
+            if not event:
+                continue
 
-        if buffer:
-            accumulated.append(buffer)
-            yield _sse_event("delta", {"content": buffer})
+            assistant_text = _assistant_text_from_codex_event(event)
+            if assistant_text:
+                accumulated.append(assistant_text)
+                yield _sse_event("delta", {"content": assistant_text})
+                continue
+
+            event_error = _error_text_from_codex_event(event)
+            if event_error:
+                structured_error = event_error
 
         return_code = process.wait()
         stderr_file.seek(0)
         stderr_text = stderr_file.read().strip()
-        content = "".join(accumulated)
+        content = "\n\n".join(part for part in accumulated if part)
 
         if last_message_path.exists():
             saved_output = last_message_path.read_text(encoding="utf-8").strip()
@@ -265,13 +349,18 @@ def stream_codex_cli_chat(
                 yield _sse_event("delta", {"content": saved_output})
             elif saved_output.startswith(content) and len(saved_output) > len(content):
                 remainder = saved_output[len(content) :]
-                accumulated.append(remainder)
+                if remainder:
+                    accumulated.append(remainder)
                 content = saved_output
-                yield _sse_event("delta", {"content": remainder})
+                if remainder:
+                    yield _sse_event("delta", {"content": remainder})
 
         if return_code != 0:
-            error_message = stderr_text or content.strip() or (
-                f"Codex CLI exited with status {return_code}."
+            error_message = (
+                structured_error
+                or _clean_codex_cli_stderr(stderr_text)
+                or content.strip()
+                or f"Codex CLI exited with status {return_code}."
             )
             yield _sse_event(
                 "error",
