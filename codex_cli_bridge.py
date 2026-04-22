@@ -147,7 +147,7 @@ def _build_codex_cli_command(
         or DEFAULT_CODEX_APPROVAL_MODE
     )
     if approval_mode:
-        command.extend(["--approval-mode", approval_mode])
+        command.extend(["--config", f'approval_policy="{approval_mode}"'])
 
     sandbox_mode = (
         merged_env.get("CODEX_CLI_SANDBOX", "").strip() or DEFAULT_CODEX_SANDBOX
