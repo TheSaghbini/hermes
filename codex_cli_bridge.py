@@ -25,6 +25,7 @@ CODEX_CLI_BASE_URL = "cli://local/v1"
 DEFAULT_CODEX_CLI_BIN = "codex"
 DEFAULT_CODEX_APPROVAL_MODE = "never"
 DEFAULT_CODEX_SANDBOX = "read-only"
+DEFAULT_CODEX_HOME_DIRNAME = ".codex"
 
 
 def _merged_env(env_values: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -81,6 +82,59 @@ def resolve_codex_cli_binary(env_values: Mapping[str, str] | None = None) -> str
 def has_codex_cli_binary(env_values: Mapping[str, str] | None = None) -> bool:
     """Check whether the configured Codex CLI binary is available."""
     return bool(shutil.which(resolve_codex_cli_binary(env_values)))
+
+
+def resolve_codex_cli_home(env_values: Mapping[str, str] | None = None) -> Path:
+    """Resolve the Codex home directory used for persisted CLI auth."""
+    merged_env = _merged_env(env_values)
+    explicit_home = merged_env.get("CODEX_HOME", "").strip()
+    if explicit_home:
+        return Path(explicit_home).expanduser()
+    return Path.home() / DEFAULT_CODEX_HOME_DIRNAME
+
+
+def resolve_codex_cli_auth_file(env_values: Mapping[str, str] | None = None) -> Path:
+    """Return the persisted Codex auth file path."""
+    return resolve_codex_cli_home(env_values) / "auth.json"
+
+
+def codex_cli_has_known_auth(env_values: Mapping[str, str] | None = None) -> bool:
+    """Check for Codex auth Hermes can verify without invoking the CLI."""
+    merged_env = _merged_env(env_values)
+    if merged_env.get("OPENAI_API_KEY", "").strip() or merged_env.get(
+        "CODEX_API_KEY", ""
+    ).strip():
+        return True
+
+    auth_file = resolve_codex_cli_auth_file(merged_env)
+    try:
+        payload = json.loads(auth_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, json.JSONDecodeError):
+        LOGGER.debug("Unable to parse Codex auth file %s", auth_file, exc_info=True)
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+
+    api_key = payload.get("OPENAI_API_KEY")
+    tokens = payload.get("tokens")
+    agent_identity = payload.get("agent_identity")
+    return bool(
+        (isinstance(api_key, str) and api_key.strip())
+        or (isinstance(tokens, dict) and tokens)
+        or (isinstance(agent_identity, dict) and agent_identity)
+    )
+
+
+def codex_cli_missing_auth_message(env_values: Mapping[str, str] | None = None) -> str:
+    """Describe how Hermes expects Codex CLI auth to be provided."""
+    auth_file = resolve_codex_cli_auth_file(env_values)
+    return (
+        "Codex CLI auth is missing. Set CODEX_API_KEY or OPENAI_API_KEY, "
+        f"or persist a Codex login at {auth_file}."
+    )
 
 
 def codex_cli_ready(
@@ -277,6 +331,16 @@ def stream_codex_cli_chat(
                     "Codex CLI binary is not available. Set CODEX_CLI_BIN or install `codex`."
                 ),
                 "code": "codex_cli_missing",
+            },
+        )
+        return {"content": "", "usage": {}}
+
+    if not codex_cli_has_known_auth(merged_env):
+        yield _sse_event(
+            "error",
+            {
+                "error": codex_cli_missing_auth_message(merged_env),
+                "code": "codex_cli_auth_missing",
             },
         )
         return {"content": "", "usage": {}}

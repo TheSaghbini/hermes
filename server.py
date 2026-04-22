@@ -79,7 +79,13 @@ from backup_manager import (
     restore_backup,
 )
 from chat_proxy import resolve_provider, stream_chat
-from codex_cli_bridge import codex_cli_ready, resolve_codex_cli_base_url
+from codex_cli_bridge import (
+    codex_cli_has_known_auth,
+    codex_cli_missing_auth_message,
+    codex_cli_ready,
+    is_codex_cli_base_url,
+    resolve_codex_cli_base_url,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -245,6 +251,12 @@ def status_payload() -> dict[str, Any]:
     """Build the admin status object consumed by the UI."""
     settings = load_settings()
     provider = normalize_provider(settings.provider)
+    env_values = read_env_file()
+    has_codex_http_url = bool(
+        settings.codex_base_url and not is_codex_cli_base_url(settings.codex_base_url)
+    )
+    has_codex_cli = codex_cli_ready(settings.codex_base_url, env_values)
+    has_codex_auth = codex_cli_has_known_auth(env_values)
     config_dict = asdict(settings)
     config_dict["ollama_api_key"] = mask_secret(settings.ollama_api_key)
     config_dict["codex_api_key"] = mask_secret(settings.codex_api_key)
@@ -255,9 +267,8 @@ def status_payload() -> dict[str, Any]:
             "provider": provider,
             "ready": is_inference_ready(settings),
             "ollama_configured": bool(settings.ollama_base_url),
-            "codex_configured": bool(
-                settings.codex_base_url or codex_cli_ready(settings.codex_base_url)
-            ),
+            "codex_configured": bool(has_codex_http_url or (has_codex_cli and has_codex_auth)),
+            "codex_auth_configured": has_codex_auth,
             "openrouter_configured": bool(settings.openrouter_api_key),
             "active_base_url": active_base_url(provider, settings.ollama_base_url),
         },
@@ -420,7 +431,7 @@ def connection_probe_config(settings: Any) -> tuple[str, str, str | None] | None
 
     if provider == "openai-codex":
         base_url = settings.codex_base_url.rstrip("/")
-        if not base_url:
+        if not base_url or is_codex_cli_base_url(base_url):
             return None
         probe_url = f"{base_url}/models" if "/v1" in base_url else f"{base_url}/v1/models"
         return provider, probe_url, settings.codex_api_key or None
@@ -621,15 +632,28 @@ def api_test_connection() -> Response:
 
     settings = load_settings()
     provider = normalize_provider(settings.provider)
+    env_values = read_env_file()
+    has_codex_cli = codex_cli_ready(settings.codex_base_url, env_values)
+    has_codex_auth = codex_cli_has_known_auth(env_values)
 
     probe = connection_probe_config(settings)
     if probe is None:
-        if provider == "openai-codex" and codex_cli_ready(settings.codex_base_url):
+        if provider == "openai-codex" and has_codex_cli and not has_codex_auth:
+            return jsonify({
+                "success": False,
+                "provider": provider,
+                "endpoint": resolve_codex_cli_base_url(settings.codex_base_url, env_values),
+                "latency_ms": 0,
+                "models": [],
+                "model_configured": bool(settings.default_model),
+                "error": codex_cli_missing_auth_message(env_values),
+            })
+        if provider == "openai-codex" and has_codex_cli:
             models = [settings.default_model] if settings.default_model else []
             return jsonify({
                 "success": True,
                 "provider": provider,
-                "endpoint": resolve_codex_cli_base_url(settings.codex_base_url),
+                "endpoint": resolve_codex_cli_base_url(settings.codex_base_url, env_values),
                 "latency_ms": 0,
                 "models": models,
                 "model_configured": bool(settings.default_model),
@@ -1227,9 +1251,14 @@ def api_models() -> Response:
     """@ai-context Query models from the active provider."""
     settings = load_settings()
     provider = normalize_provider(settings.provider)
+    env_values = read_env_file()
     probe = connection_probe_config(settings)
     if probe is None:
-        if provider == "openai-codex" and codex_cli_ready(settings.codex_base_url):
+        if (
+            provider == "openai-codex"
+            and codex_cli_ready(settings.codex_base_url, env_values)
+            and codex_cli_has_known_auth(env_values)
+        ):
             models = []
             if settings.default_model:
                 models.append({
@@ -1277,22 +1306,25 @@ def api_providers() -> Response:
     """@ai-context Return available providers with configured status."""
     settings = load_settings()
     env_values = read_env_file()
+    has_codex_http_url = bool(
+        settings.codex_base_url and not is_codex_cli_base_url(settings.codex_base_url)
+    )
+    has_codex_cli = codex_cli_ready(settings.codex_base_url, env_values)
+    has_codex_auth = codex_cli_has_known_auth(env_values)
     providers = []
     for pid, label in PROVIDER_OPTIONS:
         configured = False
         if pid in {"custom", "ollama"}:
             configured = bool(settings.ollama_base_url)
         elif pid == "openai-codex":
-            configured = bool(
-                settings.codex_base_url or codex_cli_ready(settings.codex_base_url)
-            )
+            configured = bool(has_codex_http_url or (has_codex_cli and has_codex_auth))
         elif pid == "openrouter":
             configured = bool(settings.openrouter_api_key)
         elif pid == "auto":
             configured = bool(
                 settings.ollama_base_url
-                or settings.codex_base_url
-                or codex_cli_ready(settings.codex_base_url)
+                or has_codex_http_url
+                or (has_codex_cli and has_codex_auth)
                 or settings.openrouter_api_key
             )
         else:

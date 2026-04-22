@@ -18,7 +18,12 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import yaml
 
-from codex_cli_bridge import codex_cli_ready, is_codex_cli_enabled
+from codex_cli_bridge import (
+    codex_cli_has_known_auth,
+    codex_cli_ready,
+    is_codex_cli_base_url,
+    is_codex_cli_enabled,
+)
 
 LOGGER = logging.getLogger("hermes-admin.config")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -303,6 +308,11 @@ def is_inference_ready(settings: HermesSettings) -> bool:
     provider = normalize_provider(settings.provider)
     runtime_provider = resolve_runtime_provider(provider)
     env_values = read_env_file()
+    has_codex_http_url = bool(
+        settings.codex_base_url and not is_codex_cli_base_url(settings.codex_base_url)
+    )
+    has_codex_cli = codex_cli_ready(settings.codex_base_url, env_values)
+    has_codex_cli_auth = codex_cli_has_known_auth(env_values)
 
     if provider == "openrouter":
         return bool(settings.default_model and settings.openrouter_api_key)
@@ -311,10 +321,7 @@ def is_inference_ready(settings: HermesSettings) -> bool:
     if provider == "openai-codex":
         return bool(
             settings.default_model
-            and (
-                settings.codex_base_url
-                or codex_cli_ready(settings.codex_base_url, env_values)
-            )
+            and (has_codex_http_url or (has_codex_cli and has_codex_cli_auth))
         )
     if provider == "auto":
         return bool(
@@ -322,8 +329,8 @@ def is_inference_ready(settings: HermesSettings) -> bool:
             and (
                 settings.openrouter_api_key
                 or settings.ollama_base_url
-                or settings.codex_base_url
-                or codex_cli_ready(settings.codex_base_url, env_values)
+                or has_codex_http_url
+                or (has_codex_cli and has_codex_cli_auth)
             )
         )
 

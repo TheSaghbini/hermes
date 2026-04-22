@@ -20,6 +20,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080 \
     HERMES_HOME=/data/.hermes \
     HERMES_AUTO_START=true \
+    CODEX_HOME=/data/.hermes/.codex \
     CODEX_UNSAFE_ALLOW_NO_SANDBOX=1
 
 WORKDIR /app
@@ -43,7 +44,7 @@ COPY static ./static
 COPY templates ./templates
 COPY --from=frontend-build /build/dist ./frontend/dist
 
-RUN chmod +x /app/start.sh && mkdir -p /data/.hermes
+RUN chmod +x /app/start.sh && mkdir -p /data/.hermes /data/.hermes/.codex
 
 RUN groupadd --system hermes \
     && useradd --system --gid hermes --create-home hermes \
