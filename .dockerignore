@@ -1,11 +1,5 @@
+node_modules
+.next
+dist
 .git
 .env
-.env.local
-data/
-__pycache__/
-*.py[cod]
-.DS_Store
-ollama/
-frontend/node_modules
-frontend/dist
-.github/

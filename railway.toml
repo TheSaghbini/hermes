@@ -1,7 +1,26 @@
+# Hermes — all-in-one Railway deployment
+# Runs: hermes-workspace (UI) + hermes-agent (gateway) + codex-adapter (Codex CLI bridge)
+#
+# Required env vars in Railway:
+#   OPENAI_API_KEY  — passed to Codex CLI for authentication
+#
+# Optional:
+#   API_SERVER_KEY  — shared secret for gateway auth (set same in HERMES_API_TOKEN on workspace)
+#   HERMES_PASSWORD — password-protect the web UI
+
 [build]
-dockerfile = "Dockerfile"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-healthcheckPath = "/health"
+# The workspace UI listens on $PORT (Railway injects this automatically).
+# Use "/" because the workspace UI serves on root; "/health" is the gateway route
+# and is not exposed on the same port in this image.
+healthcheckPath = "/"
+healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+
+[[volumes]]
+mountPath = "/data"
+

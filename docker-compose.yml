@@ -1,78 +1,47 @@
+# Hermes — local Docker Compose
+#
+# Runs the all-in-one image that bundles:
+#   • hermes-workspace (Node UI)   on :3000
+#   • hermes-agent (gateway)       on :8642 (internal only)
+#   • codex-adapter (Codex bridge) on :8645 (internal only)
+#
+# Quick start:
+#   cp .env.example .env
+#   # Edit .env and set OPENAI_API_KEY
+#   docker compose up
+#   open http://localhost:3000
+#
+# Build from source (instead of pulling the pre-built image):
+#   docker compose up --build
+
 services:
   hermes:
     build:
       context: .
       dockerfile: Dockerfile
-    depends_on:
-      ollama:
-        condition: service_healthy
+    # Or pull the pre-built image:
+    # image: ghcr.io/thesaghbini/hermes:latest
+    env_file:
+      - .env
     environment:
-      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-local-test-only-change-this-password}
-      HERMES_API_TOKEN: ${HERMES_API_TOKEN:-}
-      HERMES_AUTO_START: ${HERMES_AUTO_START:-true}
-      HERMES_INFERENCE_PROVIDER: ${HERMES_INFERENCE_PROVIDER:-ollama}
-      HERMES_DEFAULT_MODEL: ${HERMES_DEFAULT_MODEL:-llama3.2}
-      CODEX_HOME: /data/.hermes/.codex
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
-      CODEX_BASE_URL: ${CODEX_BASE_URL:-}
-      CODEX_API_KEY: ${CODEX_API_KEY:-}
-      CODEX_CLI_ENABLED: ${CODEX_CLI_ENABLED:-false}
-      CODEX_CLI_BIN: ${CODEX_CLI_BIN:-codex}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      API_SERVER_KEY: ${API_SERVER_KEY:-}
+      HERMES_PASSWORD: ${HERMES_PASSWORD:-}
+      PORT: ${PORT:-3000}
+      # Codex CLI settings (optional overrides)
       CODEX_CLI_SANDBOX: ${CODEX_CLI_SANDBOX:-read-only}
       CODEX_CLI_APPROVAL_MODE: ${CODEX_CLI_APPROVAL_MODE:-never}
-      CODEX_CLI_CWD: ${CODEX_CLI_CWD:-}
-      CODEX_CLI_ARGS: ${CODEX_CLI_ARGS:-}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      USE_LEGACY_UI: ${USE_LEGACY_UI:-false}
-      PORT: 8080
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
     ports:
-      - "${HERMES_PORT:-8080}:8080"
+      - "${PORT:-3000}:${PORT:-3000}"
     volumes:
       - hermes-data:/data
-
-  hermes-workspace:
-    image: ghcr.io/outsourc-e/hermes-workspace:latest
-    user: "0:0"
-    depends_on:
-      hermes:
-        condition: service_healthy
-    environment:
-      HOME: /data
-      HERMES_HOME: /data/.hermes
-      HERMES_API_URL: http://hermes:8080
-      HERMES_API_TOKEN: ${HERMES_API_TOKEN:-}
-      HOST: 0.0.0.0
-      PORT: 3000
-    ports:
-      - "${HERMES_WORKSPACE_PORT:-3000}:3000"
-    volumes:
-      - hermes-data:/data
-
-  ollama:
-    build:
-      context: ./ollama
-      dockerfile: Dockerfile
-    environment:
-      OLLAMA_DEFAULT_MODEL: ${OLLAMA_DEFAULT_MODEL:-}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT:-3000}/ || exit 1"]
+      interval: 15s
+      timeout: 10s
       retries: 5
-      start_period: 15s
-    ports:
-      - "${OLLAMA_PORT:-11434}:11434"
-    volumes:
-      - ollama-data:/root/.ollama
+      start_period: 30s
 
 volumes:
   hermes-data:
-  ollama-data:
+

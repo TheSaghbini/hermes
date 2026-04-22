@@ -1,57 +1,99 @@
-# @ai-context Railway-ready Hermes admin service.
-# Multi-stage build: React frontend + Python backend.
+# syntax=docker/dockerfile:1.6
+# Hermes Workspace — all-in-one production image
+#
+# Bundles:
+#   • hermes-workspace  (Node.js UI, TanStack Start SSR)
+#   • hermes-agent      (gateway on :8642)
+#   • codex-adapter     (Codex CLI → OpenAI-compat API on :8645)
+#   • @openai/codex     (CLI binary)
+#
+# Build:
+#   docker build -t hermes .
+# Run:
+#   docker run -p 3000:3000 -e OPENAI_API_KEY=sk-... -v hermes-data:/data hermes
 
-# Stage 1: Build React frontend
-FROM node:22-alpine AS frontend-build
-WORKDIR /build
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install
-COPY frontend/ ./
-RUN npm run build
+# ── Stage 1: build the workspace UI ──────────────────────────────────────────
+FROM node:22-slim AS build
 
-# Stage 2: Python runtime
-FROM python:3.12-slim
+RUN corepack enable \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cache-friendly: install deps before copying sources
+COPY package.json pnpm-lock.yaml* .npmrc* ./
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+RUN pnpm build
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM python:3.11-slim
 
 ARG HERMES_REF=v2026.4.8
 ARG CODEX_NPM_PACKAGE=@openai/codex@latest
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=8080 \
+    PORT=3000 \
     HERMES_HOME=/data/.hermes \
-    HERMES_AUTO_START=true \
     CODEX_HOME=/data/.hermes/.codex \
-    CODEX_UNSAFE_ALLOW_NO_SANDBOX=1
+    CODEX_UNSAFE_ALLOW_NO_SANDBOX=1 \
+    # tell hermes-agent the API server is always on in this image
+    API_SERVER_ENABLED=true \
+    API_SERVER_HOST=0.0.0.0
 
 WORKDIR /app
 
+# ── Install Node.js 22 + system utilities ─────────────────────────────────────
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl git ca-certificates nodejs npm \
-    && npm install --global "$CODEX_NPM_PACKAGE" \
-    && codex --version \
-    && npm cache clean --force \
+    && apt-get install -y --no-install-recommends \
+        curl ca-certificates tini gnupg \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
+# ── Install @openai/codex CLI globally ────────────────────────────────────────
+RUN npm install --global "$CODEX_NPM_PACKAGE" \
+    && npm cache clean --force \
+    && codex --version
 
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir \
-        "hermes-agent[messaging,cron] @ git+https://github.com/nousresearch/hermes-agent.git@${HERMES_REF}"
+# ── Install hermes-agent + codex-adapter Python deps ─────────────────────────
+COPY codex_adapter/requirements.txt /tmp/adapter-requirements.txt
+RUN pip install --no-cache-dir \
+        "hermes-agent[messaging,cron] @ git+https://github.com/nousresearch/hermes-agent.git@${HERMES_REF}" \
+    && pip install --no-cache-dir -r /tmp/adapter-requirements.txt
 
-COPY server.py gateway_manager.py hermes_config.py database.py backup_manager.py chat_proxy.py codex_cli_bridge.py ./
+# ── Create non-root user ──────────────────────────────────────────────────────
+RUN groupadd -r workspace \
+    && useradd -r -g workspace -u 10010 -m workspace \
+    && mkdir -p /data/.hermes /data/.hermes/.codex
+
+# ── Copy workspace build artefacts ───────────────────────────────────────────
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/server-entry.js ./server-entry.js
+COPY --from=build /app/public ./public
+COPY --from=build /app/skills ./skills
+
+# ── Copy adapter + bridge + entrypoint ───────────────────────────────────────
+COPY codex_adapter/ ./codex_adapter/
+COPY codex_cli_bridge.py ./
 COPY start.sh ./
-COPY static ./static
-COPY templates ./templates
-COPY --from=frontend-build /build/dist ./frontend/dist
 
-RUN chmod +x /app/start.sh && mkdir -p /data/.hermes /data/.hermes/.codex
+RUN chmod +x /app/start.sh \
+    && chown -R workspace:workspace /app /data
 
-RUN groupadd --system hermes \
-    && useradd --system --gid hermes --create-home hermes \
-    && chown -R hermes:hermes /data
+USER workspace
 
-USER hermes
+EXPOSE 3000
 
-EXPOSE 8080
-
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/app/start.sh"]
