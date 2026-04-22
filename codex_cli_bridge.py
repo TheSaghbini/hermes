@@ -57,8 +57,6 @@ def is_codex_cli_enabled(
         return False
 
     merged_env = _merged_env(env_values)
-    if merged_env.get("CODEX_CLI_BIN", "").strip():
-        return True
     return _is_truthy(merged_env.get("CODEX_CLI_ENABLED", ""))
 
 
