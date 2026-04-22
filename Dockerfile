@@ -13,17 +13,22 @@ RUN npm run build
 FROM python:3.12-slim
 
 ARG HERMES_REF=v2026.4.8
+ARG CODEX_NPM_PACKAGE=@openai/codex@latest
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080 \
     HERMES_HOME=/data/.hermes \
-    HERMES_AUTO_START=true
+    HERMES_AUTO_START=true \
+    CODEX_UNSAFE_ALLOW_NO_SANDBOX=1
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends curl git ca-certificates nodejs npm \
+    && npm install --global "$CODEX_NPM_PACKAGE" \
+    && codex --version \
+    && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -32,7 +37,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir \
         "hermes-agent[messaging,cron] @ git+https://github.com/nousresearch/hermes-agent.git@${HERMES_REF}"
 
-COPY server.py gateway_manager.py hermes_config.py database.py backup_manager.py chat_proxy.py ./
+COPY server.py gateway_manager.py hermes_config.py database.py backup_manager.py chat_proxy.py codex_cli_bridge.py ./
 COPY start.sh ./
 COPY static ./static
 COPY templates ./templates
