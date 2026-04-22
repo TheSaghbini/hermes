@@ -129,10 +129,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_conversation(title: str, model: str, system_prompt: str = "") -> dict:
+def create_conversation(
+    title: str,
+    model: str,
+    system_prompt: str = "",
+    conversation_id: str | None = None,
+) -> dict:
     """Insert a new conversation and return it as a dict."""
     conn = get_db()
-    cid = str(uuid.uuid4())
+    cid = conversation_id or str(uuid.uuid4())
     conn.execute(
         "INSERT INTO conversations (id, title, model, system_prompt) VALUES (?, ?, ?, ?)",
         (cid, title, model, system_prompt),
@@ -154,6 +159,12 @@ def list_conversations(limit: int = 50, offset: int = 0) -> list[dict]:
         (limit, offset),
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def count_conversations() -> int:
+    """Return the total number of persisted conversations."""
+    row = get_db().execute("SELECT COUNT(*) AS total FROM conversations").fetchone()
+    return int(row["total"] if row is not None else 0)
 
 
 def update_conversation(conversation_id: str, title: str) -> dict:

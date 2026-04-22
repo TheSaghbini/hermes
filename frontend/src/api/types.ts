@@ -18,9 +18,12 @@ export interface ConfigState {
   default_model: string;
   ollama_base_url: string;
   ollama_api_key: string;
+  codex_base_url: string;
+  codex_api_key: string;
   openrouter_api_key: string;
   active_base_url: string;
   ollama_configured: boolean;
+  codex_configured: boolean;
   openrouter_configured: boolean;
   ready: boolean;
 }

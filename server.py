@@ -9,6 +9,7 @@ Dependencies: Flask, waitress, gateway_manager.py, hermes_config.py.
 from __future__ import annotations
 
 import atexit
+import calendar
 import hmac
 import json as _json
 import logging
@@ -19,8 +20,10 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
+import uuid
 
 import queue
 import re
@@ -45,14 +48,18 @@ from hermes_config import (
     is_inference_ready,
     load_settings,
     normalize_provider,
+    read_config_file,
     read_env_file,
+    resolve_runtime_provider,
     save_settings,
     seed_files_from_env,
+    write_config_file,
     write_env_file,
 )
 from database import (
     add_message,
     close_db,
+    count_conversations,
     create_conversation,
     delete_conversation,
     get_conversation,
@@ -72,6 +79,7 @@ from backup_manager import (
     restore_backup,
 )
 from chat_proxy import resolve_provider, stream_chat
+from codex_cli_bridge import codex_cli_ready, resolve_codex_cli_base_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +93,7 @@ GENERATED_PASSWORD = secrets.token_urlsafe(18)
 LOCAL_TEST_ONLY_ADMIN_PASSWORD = "local-test-only-change-this-password"
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", GENERATED_PASSWORD)
+API_TOKEN = os.getenv("HERMES_API_TOKEN", "").strip()
 TRUSTED_ORIGIN = os.getenv("TRUSTED_ORIGIN", "").strip()
 AUTO_START = os.getenv("HERMES_AUTO_START", "true").strip().lower() not in {
     "0",
@@ -134,6 +143,26 @@ def require_basic_auth() -> Response | None:
         return admin_response()
     if not hmac.compare_digest(auth.password or "", ADMIN_PASSWORD):
         return admin_response()
+    return None
+
+
+def has_valid_bearer_token() -> bool:
+    """Allow server-to-server API access with a shared bearer token."""
+    if not API_TOKEN:
+        return False
+    authorization = request.headers.get("Authorization", "").strip()
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return False
+    return hmac.compare_digest(token.strip(), API_TOKEN)
+
+
+def authenticate_request() -> str | None:
+    """Return the auth mode for this request when credentials are valid."""
+    if has_valid_bearer_token():
+        return "bearer"
+    if require_basic_auth() is None:
+        return "basic"
     return None
 
 
@@ -201,7 +230,11 @@ def read_json_object() -> tuple[dict[str, Any] | None, Response | None]:
 
 def active_base_url(provider: str, ollama_base_url: str) -> str:
     """Expose the endpoint Hermes will actively use for the current provider."""
-    if provider == "custom":
+    runtime_provider = resolve_runtime_provider(provider)
+    if provider == "openai-codex":
+        settings = load_settings()
+        return resolve_codex_cli_base_url(settings.codex_base_url)
+    if runtime_provider == "custom":
         return ollama_base_url
     if provider == "openrouter":
         return DEFAULT_OPENROUTER_BASE_URL
@@ -214,6 +247,7 @@ def status_payload() -> dict[str, Any]:
     provider = normalize_provider(settings.provider)
     config_dict = asdict(settings)
     config_dict["ollama_api_key"] = mask_secret(settings.ollama_api_key)
+    config_dict["codex_api_key"] = mask_secret(settings.codex_api_key)
     config_dict["openrouter_api_key"] = mask_secret(settings.openrouter_api_key)
     return {
         "config": {
@@ -221,6 +255,9 @@ def status_payload() -> dict[str, Any]:
             "provider": provider,
             "ready": is_inference_ready(settings),
             "ollama_configured": bool(settings.ollama_base_url),
+            "codex_configured": bool(
+                settings.codex_base_url or codex_cli_ready(settings.codex_base_url)
+            ),
             "openrouter_configured": bool(settings.openrouter_api_key),
             "active_base_url": active_base_url(provider, settings.ollama_base_url),
         },
@@ -228,14 +265,181 @@ def status_payload() -> dict[str, Any]:
     }
 
 
+def parse_event_block(raw_event: str) -> tuple[str, dict[str, Any]]:
+    """Decode an internal SSE event block into an event name and JSON payload."""
+    event_name = ""
+    data_parts: list[str] = []
+    for line in raw_event.strip().splitlines():
+        if line.startswith("event: "):
+            event_name = line[7:].strip()
+        elif line.startswith("data: "):
+            data_parts.append(line[6:])
+    data = {}
+    if data_parts:
+        try:
+            data = _json.loads("".join(data_parts))
+        except _json.JSONDecodeError:
+            data = {}
+    return event_name, data
+
+
+def sse_event(event: str, data: dict[str, Any]) -> str:
+    """Encode a JSON payload as an SSE event block."""
+    return f"event: {event}\ndata: {_json.dumps(data)}\n\n"
+
+
+def iso_to_unix_seconds(value: str | None) -> int:
+    """Convert an ISO 8601 UTC timestamp to unix seconds."""
+    if not value:
+        return 0
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return 0
+    return calendar.timegm(parsed.utctimetuple())
+
+
+def conversation_to_gateway_session(conversation: dict[str, Any]) -> dict[str, Any]:
+    """Map a persisted conversation to the session shape Workspace expects."""
+    messages = get_messages(conversation["id"])
+    prompt_tokens = sum(int(message.get("prompt_tokens") or 0) for message in messages)
+    completion_tokens = sum(
+        int(message.get("completion_tokens") or 0) for message in messages
+    )
+    preview = messages[-1]["content"][:240] if messages else ""
+    return {
+        "id": conversation["id"],
+        "source": "hermes-admin",
+        "user_id": None,
+        "model": conversation.get("model") or "",
+        "title": conversation.get("title") or conversation["id"],
+        "started_at": iso_to_unix_seconds(conversation.get("created_at")),
+        "ended_at": None,
+        "end_reason": None,
+        "message_count": len(messages),
+        "tool_call_count": 0,
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "parent_session_id": None,
+        "last_active": iso_to_unix_seconds(conversation.get("updated_at")),
+        "is_active": True,
+        "preview": preview,
+    }
+
+
+def message_to_gateway_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Map a persisted message to the Hermes session message shape."""
+    return {
+        "id": message["id"],
+        "session_id": message["conversation_id"],
+        "role": message["role"],
+        "content": message["content"],
+        "tool_call_id": None,
+        "tool_calls": [],
+        "tool_name": None,
+        "timestamp": iso_to_unix_seconds(message.get("created_at")),
+        "token_count": int(message.get("prompt_tokens") or 0)
+        + int(message.get("completion_tokens") or 0),
+        "finish_reason": "stop" if message["role"] == "assistant" else None,
+    }
+
+
+def default_model_config(settings: Any) -> dict[str, Any]:
+    """Expose the active model/provider config in a lightweight gateway shape."""
+    provider = normalize_provider(settings.provider)
+    base_url = active_base_url(provider, settings.ollama_base_url)
+    config = read_env_file()
+    payload = read_config_file()
+    model_block = payload.get("model") if isinstance(payload, dict) else None
+    if not isinstance(model_block, dict):
+        model_block = {}
+    return {
+        **payload,
+        "provider": provider,
+        "model": {
+            **model_block,
+            "provider": provider,
+            "default": settings.default_model,
+            "base_url": base_url or model_block.get("base_url", ""),
+        },
+        "base_url": base_url,
+        "env": config,
+    }
+
+
+def consume_chat_stream(
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    messages: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    """Run the internal streaming proxy to completion and return full text + usage."""
+    accumulated: list[str] = []
+    usage: dict[str, Any] = {}
+    for raw_event in stream_chat(base_url, api_key, model, messages):
+        event_name, data = parse_event_block(raw_event)
+        if event_name == "delta":
+            piece = str(data.get("content") or "")
+            if piece:
+                accumulated.append(piece)
+        elif event_name == "done":
+            usage = data.get("usage") or usage
+        elif event_name == "error":
+            message = str(data.get("error") or data.get("message") or "Provider error")
+            raise RuntimeError(message)
+    return "".join(accumulated), usage
+
+
+def build_conversation_messages(
+    conversation: dict[str, Any],
+    system_prompt_override: str,
+) -> list[dict[str, Any]]:
+    """Render the stored conversation into provider chat-completion messages."""
+    history = get_messages(conversation["id"])
+    messages: list[dict[str, Any]] = []
+    effective_system = system_prompt_override or conversation.get("system_prompt", "")
+    if effective_system:
+        messages.append({"role": "system", "content": effective_system})
+    for msg in history:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    return messages
+
+
+def connection_probe_config(settings: Any) -> tuple[str, str, str | None] | None:
+    """Resolve provider label, probe URL, and API key for model listing/tests."""
+    provider = normalize_provider(settings.provider)
+    if provider == "openrouter":
+        return provider, f"{DEFAULT_OPENROUTER_BASE_URL}/models", settings.openrouter_api_key or None
+
+    if provider in {"custom", "ollama"}:
+        base_url = settings.ollama_base_url.rstrip("/")
+        if not base_url:
+            return None
+        probe_url = f"{base_url}/models" if "/v1" in base_url else f"{base_url}/v1/models"
+        return provider, probe_url, settings.ollama_api_key or None
+
+    if provider == "openai-codex":
+        base_url = settings.codex_base_url.rstrip("/")
+        if not base_url:
+            return None
+        probe_url = f"{base_url}/models" if "/v1" in base_url else f"{base_url}/v1/models"
+        return provider, probe_url, settings.codex_api_key or None
+
+    return None
+
+
 @APP.before_request
 def protect_admin_routes() -> Response | None:
     """Leave health public while protecting the rest of the admin surface."""
     if request.path == "/health":
         return None
-    auth_failure = require_basic_auth()
-    if auth_failure is not None:
-        return auth_failure
+    auth_mode = authenticate_request()
+    if auth_mode is None:
+        return admin_response()
+    if auth_mode == "bearer":
+        if request.method in STATE_CHANGING_METHODS and not request.is_json:
+            return json_error("State-changing routes only accept JSON requests.", 415)
+        return None
     return require_same_origin_json_write()
 
 
@@ -303,6 +507,44 @@ def api_config() -> Response:
     return jsonify(status_payload())
 
 
+@APP.get("/api/config")
+def api_get_config() -> Response:
+    """Return the active raw Hermes config payload."""
+    settings = load_settings()
+    return jsonify(default_model_config(settings))
+
+
+@APP.patch("/api/config")
+def api_patch_config() -> Response:
+    """Apply a partial config patch for Workspace-compatible clients."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    if payload is None:
+        return json_error("Empty payload.", 400)
+
+    current = read_config_file()
+    if not isinstance(current, dict):
+        current = {}
+
+    def deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:
+        for key, value in updates.items():
+            if value is None:
+                target.pop(key, None)
+            elif isinstance(value, dict) and isinstance(target.get(key), dict):
+                deep_merge(target[key], value)
+            elif isinstance(value, dict):
+                nested: dict[str, Any] = {}
+                deep_merge(nested, value)
+                target[key] = nested
+            else:
+                target[key] = value
+
+    deep_merge(current, payload)
+    write_config_file(CONFIG_PATH, current)
+    return jsonify(current)
+
+
 @APP.post("/api/gateway/<action>")
 def api_gateway(action: str) -> Response:
     """Expose explicit start, stop, and restart controls for the gateway."""
@@ -352,13 +594,13 @@ def _probe_endpoint(url: str, api_key: str | None, timeout: int = 10) -> dict[st
         if isinstance(reason, socket.timeout):
             msg = f"Connection timed out after {timeout}s. Check that the URL is correct and the service is reachable."
         elif isinstance(reason, OSError) and reason.errno == 111:
-            msg = f"Cannot connect to {url}. Is the Ollama service running?"
+            msg = f"Cannot connect to {url}. Is the configured service running?"
         elif isinstance(reason, socket.gaierror):
             msg = "Cannot resolve hostname. Check the URL."
         elif "Connection refused" in str(reason):
-            msg = f"Cannot connect to {url}. Is the Ollama service running?"
+            msg = f"Cannot connect to {url}. Is the configured service running?"
         else:
-            msg = f"Cannot connect to {url}. Is the Ollama service running?"
+            msg = f"Cannot connect to {url}. Is the configured service running?"
         return {"success": False, "latency_ms": latency_ms, "models": [], "error": msg}
     except socket.timeout:
         latency_ms = round((time.monotonic() - start) * 1000)
@@ -380,35 +622,34 @@ def api_test_connection() -> Response:
     settings = load_settings()
     provider = normalize_provider(settings.provider)
 
-    if provider == "custom":
-        base = settings.ollama_base_url.rstrip("/")
-        if not base:
+    probe = connection_probe_config(settings)
+    if probe is None:
+        if provider == "openai-codex" and codex_cli_ready(settings.codex_base_url):
+            models = [settings.default_model] if settings.default_model else []
             return jsonify({
-                "success": False, "provider": provider, "endpoint": "",
-                "latency_ms": 0, "models": [], "model_configured": False,
-                "error": "No Ollama base URL configured. Save your settings first.",
+                "success": True,
+                "provider": provider,
+                "endpoint": resolve_codex_cli_base_url(settings.codex_base_url),
+                "latency_ms": 0,
+                "models": models,
+                "model_configured": bool(settings.default_model),
+                "error": "",
             })
-        probe_url = f"{base}/v1/models" if "/v1" not in base else f"{base}/models"
-        result = _probe_endpoint(probe_url, settings.ollama_api_key or None)
-        endpoint = base
-
-    elif provider == "openrouter":
-        if not settings.openrouter_api_key:
+        if provider == "openrouter":
             return jsonify({
                 "success": False, "provider": provider, "endpoint": DEFAULT_OPENROUTER_BASE_URL,
                 "latency_ms": 0, "models": [], "model_configured": False,
                 "error": "No OpenRouter API key configured. Save your settings first.",
             })
-        probe_url = f"{DEFAULT_OPENROUTER_BASE_URL}/models"
-        result = _probe_endpoint(probe_url, settings.openrouter_api_key)
-        endpoint = DEFAULT_OPENROUTER_BASE_URL
-
-    else:
         return jsonify({
             "success": False, "provider": provider, "endpoint": "",
             "latency_ms": 0, "models": [], "model_configured": False,
             "error": f"Connection test not available for the '{provider}' provider.",
         })
+
+    _, probe_url, api_key = probe
+    result = _probe_endpoint(probe_url, api_key)
+    endpoint = probe_url.removesuffix("/models").removesuffix("/v1") if probe_url.endswith("/v1/models") else probe_url.removesuffix("/models")
 
     model_configured = bool(
         settings.default_model and settings.default_model in result["models"]
@@ -463,13 +704,7 @@ def api_chat() -> Response:
     add_message(conversation_id, "user", message)
 
     # Build message history
-    history = get_messages(conversation_id)
-    messages: list[dict] = []
-    effective_system = system_prompt or conversation.get("system_prompt", "")
-    if effective_system:
-        messages.append({"role": "system", "content": effective_system})
-    for msg in history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages = build_conversation_messages(conversation, system_prompt)
 
     base_url, api_key = resolve_provider(settings)
     if not base_url:
@@ -507,6 +742,348 @@ def api_chat() -> Response:
     )
 
 
+@APP.get("/v1/models")
+def api_v1_models() -> Response:
+    """Return OpenAI-compatible model metadata for Hermes Workspace portable mode."""
+    settings = load_settings()
+    probe = connection_probe_config(settings)
+    models: list[dict[str, Any]] = []
+    if probe is not None:
+        provider, probe_url, api_key = probe
+        result = _probe_endpoint(probe_url, api_key)
+        models = [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": provider,
+            }
+            for model_id in result.get("models", [])
+        ]
+    elif settings.default_model:
+        models = [{
+            "id": settings.default_model,
+            "object": "model",
+            "created": 0,
+            "owned_by": normalize_provider(settings.provider),
+        }]
+    return jsonify({"object": "list", "data": models})
+
+
+@APP.post("/v1/chat/completions")
+def api_v1_chat_completions() -> Response:
+    """Expose a minimal OpenAI-compatible chat completions surface."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    if payload is None:
+        return json_error("Empty payload.", 400)
+
+    settings = load_settings()
+    model = str(payload.get("model") or settings.default_model or "").strip()
+    raw_messages = payload.get("messages")
+    stream = bool(payload.get("stream"))
+    if not model:
+        return json_error("model is required.", 400)
+    if not isinstance(raw_messages, list) or not raw_messages:
+        return json_error("messages must be a non-empty array.", 400)
+
+    messages = [
+        {"role": str(entry.get("role") or "user"), "content": entry.get("content") or ""}
+        for entry in raw_messages
+        if isinstance(entry, dict)
+    ]
+    base_url, api_key = resolve_provider(settings)
+    if not base_url:
+        return json_error("No provider base URL configured.", 400)
+
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_at = int(time.time())
+
+    if not stream:
+        try:
+            content, usage = consume_chat_stream(base_url, api_key, model, messages)
+        except RuntimeError as exc:
+            return json_error(str(exc), 502)
+        return jsonify({
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_at,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+            "usage": usage,
+        })
+
+    def generate() -> Any:
+        done_sent = False
+        for raw_event in stream_chat(base_url, api_key, model, messages):
+            event_name, data = parse_event_block(raw_event)
+            if event_name == "delta":
+                piece = str(data.get("content") or "")
+                if not piece:
+                    continue
+                chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_at,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": piece},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {_json.dumps(chunk)}\n\n"
+            elif event_name == "done":
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_at,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                }
+                usage = data.get("usage")
+                if usage:
+                    final_chunk["usage"] = usage
+                yield f"data: {_json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                done_sent = True
+            elif event_name == "error":
+                error_chunk = {
+                    "error": {
+                        "message": str(data.get("error") or data.get("message") or "Provider error"),
+                        "type": "provider_error",
+                    }
+                }
+                yield f"data: {_json.dumps(error_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                done_sent = True
+        if not done_sent:
+            yield "data: [DONE]\n\n"
+
+    return Response(
+        generate(),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@APP.get("/api/sessions")
+def api_list_sessions() -> Response:
+    """List sessions in the Hermes Workspace gateway shape."""
+    limit = request.args.get("limit", 50, type=int)
+    offset = request.args.get("offset", 0, type=int)
+    sessions = [
+        conversation_to_gateway_session(conversation)
+        for conversation in list_conversations(limit, offset)
+    ]
+    return jsonify({
+        "items": sessions,
+        "sessions": sessions,
+        "total": count_conversations(),
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@APP.post("/api/sessions")
+def api_create_session() -> Response:
+    """Create a session using the workspace-compatible payload shape."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    payload = payload or {}
+    settings = load_settings()
+    session_id = str(payload.get("id") or payload.get("friendlyId") or uuid.uuid4())
+    title = str(payload.get("title") or payload.get("label") or session_id).strip()
+    model = str(payload.get("model") or settings.default_model or "").strip()
+    conversation = create_conversation(title, model, str(payload.get("system_message") or ""), session_id)
+    return jsonify({"session": conversation_to_gateway_session(conversation)})
+
+
+@APP.get("/api/sessions/<session_id>")
+def api_get_session(session_id: str) -> Response:
+    """Return a single session by id."""
+    conversation = get_conversation(session_id)
+    if conversation is None:
+        return json_error("Session not found.", 404)
+    return jsonify({"session": conversation_to_gateway_session(conversation)})
+
+
+@APP.patch("/api/sessions/<session_id>")
+def api_patch_session(session_id: str) -> Response:
+    """Rename a session in the workspace-compatible shape."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    title = str((payload or {}).get("title") or "").strip()
+    if not title:
+        return json_error("title is required.", 400)
+    if get_conversation(session_id) is None:
+        return json_error("Session not found.", 404)
+    updated = update_conversation(session_id, title)
+    return jsonify({"session": conversation_to_gateway_session(updated)})
+
+
+@APP.delete("/api/sessions/<session_id>")
+def api_delete_session(session_id: str) -> Response:
+    """Delete a session by id."""
+    if get_conversation(session_id) is None:
+        return json_error("Session not found.", 404)
+    delete_conversation(session_id)
+    return jsonify({"ok": True, "sessionKey": session_id})
+
+
+@APP.get("/api/sessions/<session_id>/messages")
+def api_get_session_messages(session_id: str) -> Response:
+    """Return messages for a session in the Hermes Workspace gateway shape."""
+    if get_conversation(session_id) is None:
+        return json_error("Session not found.", 404)
+    items = [message_to_gateway_message(message) for message in get_messages(session_id)]
+    return jsonify({"items": items, "messages": items, "total": len(items)})
+
+
+@APP.post("/api/sessions/<session_id>/chat")
+def api_session_chat(session_id: str) -> Response:
+    """Send a non-streaming session chat message."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    payload = payload or {}
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        return json_error("message is required.", 400)
+
+    conversation = get_conversation(session_id)
+    if conversation is None:
+        return json_error("Session not found.", 404)
+
+    settings = load_settings()
+    model = str(payload.get("model") or conversation.get("model") or settings.default_model or "").strip()
+    if not model:
+        return json_error("No model configured.", 400)
+
+    add_message(session_id, "user", message)
+    messages = build_conversation_messages(conversation, str(payload.get("system_message") or ""))
+    base_url, api_key = resolve_provider(settings)
+    if not base_url:
+        return json_error("No provider base URL configured.", 400)
+
+    try:
+        content, usage = consume_chat_stream(base_url, api_key, model, messages)
+    except RuntimeError as exc:
+        return json_error(str(exc), 502)
+
+    assistant = add_message(
+        session_id,
+        "assistant",
+        content,
+        model=model,
+        prompt_tokens=(usage or {}).get("prompt_tokens"),
+        completion_tokens=(usage or {}).get("completion_tokens"),
+    )
+    return jsonify({
+        "ok": True,
+        "session": conversation_to_gateway_session(get_conversation(session_id) or conversation),
+        "message": message_to_gateway_message(assistant),
+    })
+
+
+@APP.post("/api/sessions/<session_id>/chat/stream")
+def api_session_chat_stream(session_id: str) -> Response:
+    """Send a streaming session chat message with Hermes-style SSE events."""
+    payload, error = read_json_object()
+    if error is not None:
+        return error
+    payload = payload or {}
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        return json_error("message is required.", 400)
+
+    conversation = get_conversation(session_id)
+    if conversation is None:
+        return json_error("Session not found.", 404)
+
+    settings = load_settings()
+    model = str(payload.get("model") or conversation.get("model") or settings.default_model or "").strip()
+    if not model:
+        return json_error("No model configured.", 400)
+
+    base_url, api_key = resolve_provider(settings)
+    if not base_url:
+        return json_error("No provider base URL configured.", 400)
+
+    add_message(session_id, "user", message)
+    messages = build_conversation_messages(conversation, str(payload.get("system_message") or ""))
+    pending_assistant_id = str(uuid.uuid4())
+
+    def generate() -> Any:
+        accumulated: list[str] = []
+        usage: dict[str, Any] = {}
+        persisted = False
+        yield sse_event("started", {"sessionKey": session_id, "friendlyId": session_id})
+        yield sse_event(
+            "message.started",
+            {"message": {"id": pending_assistant_id, "role": "assistant"}, "sessionKey": session_id},
+        )
+        try:
+            for raw_event in stream_chat(base_url, api_key, model, messages):
+                event_name, data = parse_event_block(raw_event)
+                if event_name == "delta":
+                    delta = str(data.get("content") or "")
+                    if not delta:
+                        continue
+                    accumulated.append(delta)
+                    yield sse_event("assistant.delta", {"delta": delta, "sessionKey": session_id})
+                elif event_name == "done":
+                    usage = data.get("usage") or {}
+                    content = "".join(accumulated)
+                    if content:
+                        assistant = add_message(
+                            session_id,
+                            "assistant",
+                            content,
+                            model=model,
+                            prompt_tokens=usage.get("prompt_tokens"),
+                            completion_tokens=usage.get("completion_tokens"),
+                        )
+                        persisted = True
+                        yield sse_event(
+                            "assistant.completed",
+                            {"content": content, "message": message_to_gateway_message(assistant), "sessionKey": session_id},
+                        )
+                    yield sse_event("run.completed", {"state": "complete", "sessionKey": session_id})
+                elif event_name == "error":
+                    error_message = str(data.get("error") or data.get("message") or "Provider error")
+                    yield sse_event("error", {"message": error_message, "sessionKey": session_id})
+        except GeneratorExit:
+            return
+        finally:
+            if not persisted and accumulated:
+                add_message(
+                    session_id,
+                    "assistant",
+                    "".join(accumulated),
+                    model=model,
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                )
+
+    return Response(
+        generate(),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @APP.get("/api/conversations")
 def api_list_conversations() -> Response:
     """@ai-context List conversations with pagination."""
@@ -535,7 +1112,12 @@ def api_create_conversation() -> Response:
     title = (payload or {}).get("title", "New Conversation")
     model = (payload or {}).get("model") or settings.default_model or ""
     system_prompt = (payload or {}).get("system_prompt", "")
-    conversation = create_conversation(title, model, system_prompt)
+    conversation = create_conversation(
+        title,
+        model,
+        system_prompt,
+        conversation_id=(payload or {}).get("id"),
+    )
     return jsonify(conversation), 201
 
 
@@ -645,23 +1227,49 @@ def api_models() -> Response:
     """@ai-context Query models from the active provider."""
     settings = load_settings()
     provider = normalize_provider(settings.provider)
-
-    if provider == "custom":
-        base = settings.ollama_base_url.rstrip("/")
-        if not base:
-            return jsonify({"models": []})
-        probe_url = f"{base}/v1/models" if "/v1" not in base else f"{base}/models"
-        result = _probe_endpoint(probe_url, settings.ollama_api_key or None)
-    elif provider == "openrouter":
-        if not settings.openrouter_api_key:
-            return jsonify({"models": []})
-        probe_url = f"{DEFAULT_OPENROUTER_BASE_URL}/models"
-        result = _probe_endpoint(probe_url, settings.openrouter_api_key)
-    else:
+    probe = connection_probe_config(settings)
+    if probe is None:
+        if provider == "openai-codex" and codex_cli_ready(settings.codex_base_url):
+            models = []
+            if settings.default_model:
+                models.append({
+                    "id": settings.default_model,
+                    "name": settings.default_model,
+                    "provider": provider,
+                })
+            return jsonify({
+                "ok": True,
+                "object": "list",
+                "data": models,
+                "models": models,
+                "configuredProviders": [provider],
+                "currentProvider": provider,
+                "providerLabels": {pid: label for pid, label in PROVIDER_OPTIONS},
+                "providers": [
+                    {"id": pid, "label": label, "authenticated": pid == provider}
+                    for pid, label in PROVIDER_OPTIONS
+                ],
+            })
         return jsonify({"models": []})
 
-    models = [{"id": m} for m in result.get("models", [])]
-    return jsonify({"models": models})
+    provider, probe_url, api_key = probe
+    result = _probe_endpoint(probe_url, api_key)
+
+    models = [{"id": m, "name": m, "provider": provider} for m in result.get("models", [])]
+    configured_providers = sorted({provider} if models else [])
+    return jsonify({
+        "ok": True,
+        "object": "list",
+        "data": models,
+        "models": models,
+        "configuredProviders": configured_providers,
+        "currentProvider": provider,
+        "providerLabels": {pid: label for pid, label in PROVIDER_OPTIONS},
+        "providers": [
+            {"id": pid, "label": label, "authenticated": provider == pid and bool(models)}
+            for pid, label in PROVIDER_OPTIONS
+        ],
+    })
 
 
 @APP.get("/api/providers")
@@ -672,12 +1280,21 @@ def api_providers() -> Response:
     providers = []
     for pid, label in PROVIDER_OPTIONS:
         configured = False
-        if pid == "custom":
+        if pid in {"custom", "ollama"}:
             configured = bool(settings.ollama_base_url)
+        elif pid == "openai-codex":
+            configured = bool(
+                settings.codex_base_url or codex_cli_ready(settings.codex_base_url)
+            )
         elif pid == "openrouter":
             configured = bool(settings.openrouter_api_key)
         elif pid == "auto":
-            configured = bool(settings.ollama_base_url or settings.openrouter_api_key)
+            configured = bool(
+                settings.ollama_base_url
+                or settings.codex_base_url
+                or codex_cli_ready(settings.codex_base_url)
+                or settings.openrouter_api_key
+            )
         else:
             required = PROVIDER_ENV_REQUIREMENTS.get(pid, ())
             configured = any(env_values.get(k) or os.getenv(k) for k in required)

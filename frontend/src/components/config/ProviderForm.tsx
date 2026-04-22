@@ -96,6 +96,8 @@ export function ProviderForm() {
   const [defaultModel, setDefaultModel] = useState("");
   const [ollamaBaseUrl, setOllamaBaseUrl] = useState("");
   const [ollamaApiKey, setOllamaApiKey] = useState("");
+  const [codexBaseUrl, setCodexBaseUrl] = useState("");
+  const [codexApiKey, setCodexApiKey] = useState("");
   const [openrouterApiKey, setOpenrouterApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -110,7 +112,9 @@ export function ProviderForm() {
         setProvider(c.provider);
         setDefaultModel(c.default_model);
         setOllamaBaseUrl(c.ollama_base_url);
+        setCodexBaseUrl(c.codex_base_url);
         if (!c.ollama_api_key.startsWith(MASKED)) setOllamaApiKey(c.ollama_api_key);
+        if (!c.codex_api_key.startsWith(MASKED)) setCodexApiKey(c.codex_api_key);
         if (!c.openrouter_api_key.startsWith(MASKED)) setOpenrouterApiKey(c.openrouter_api_key);
         setLoaded(true);
       } catch (err) {
@@ -129,6 +133,8 @@ export function ProviderForm() {
           default_model: defaultModel,
           ollama_base_url: ollamaBaseUrl,
           ollama_api_key: ollamaApiKey,
+          codex_base_url: codexBaseUrl,
+          codex_api_key: codexApiKey,
           openrouter_api_key: openrouterApiKey,
         },
         restart,
@@ -185,6 +191,7 @@ export function ProviderForm() {
           <select id="cfg-provider" value={provider} onChange={(e) => setProvider(e.target.value)}>
             <option value="auto">Auto-detect</option>
             <option value="ollama">Ollama</option>
+            <option value="openai-codex">OpenAI Codex</option>
             <option value="openrouter">OpenRouter</option>
             <option value="custom">Custom OpenAI-compatible</option>
           </select>
@@ -207,6 +214,11 @@ export function ProviderForm() {
           <label htmlFor="cfg-ollama-url">Ollama / Custom Endpoint URL</label>
           <input id="cfg-ollama-url" type="url" value={ollamaBaseUrl} onChange={(e) => setOllamaBaseUrl(e.target.value)} placeholder="http://localhost:11434" />
         </div>
+
+        <div className="field">
+          <label htmlFor="cfg-codex-url">Codex Endpoint URL</label>
+          <input id="cfg-codex-url" type="text" value={codexBaseUrl} onChange={(e) => setCodexBaseUrl(e.target.value)} placeholder="http://127.0.0.1:4317/v1 or cli://local" />
+        </div>
       </div>
 
       {/* ── API Keys ── */}
@@ -221,6 +233,13 @@ export function ProviderForm() {
             <label htmlFor="cfg-ollama-key">Ollama / Custom API Key</label>
             <input id="cfg-ollama-key" type="password" value={ollamaApiKey} onChange={(e) => setOllamaApiKey(e.target.value)} placeholder="Optional" autoComplete="off" />
           </div>
+          <div className="field">
+            <label htmlFor="cfg-codex-key">Codex API Key</label>
+            <input id="cfg-codex-key" type="password" value={codexApiKey} onChange={(e) => setCodexApiKey(e.target.value)} placeholder="Optional" autoComplete="off" />
+          </div>
+        </div>
+
+        <div className="field-row">
           <div className="field">
             <label htmlFor="cfg-or-key">OpenRouter API Key</label>
             <input id="cfg-or-key" type="password" value={openrouterApiKey} onChange={(e) => setOpenrouterApiKey(e.target.value)} placeholder="sk-or-..." autoComplete="off" />

@@ -18,6 +18,8 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import yaml
 
+from codex_cli_bridge import codex_cli_ready, is_codex_cli_enabled
+
 LOGGER = logging.getLogger("hermes-admin.config")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 HERMES_HOME = Path(os.getenv("HERMES_HOME", str(DATA_DIR / ".hermes")))
@@ -29,9 +31,17 @@ LOCAL_OLLAMA_HINT = "http://ollama:11434"
 RAILWAY_OLLAMA_HINT = "http://${{YOUR_OLLAMA_SERVICE.RAILWAY_PRIVATE_DOMAIN}}:11434"
 OPENAI_KEY_MARKER = "HERMES_TEMPLATE_OPENAI_API_KEY_SOURCE"
 OPENAI_KEY_MARKER_VALUE = "ollama_admin"
-CUSTOM_PROVIDER_ALIASES = {"custom", "ollama", "lmstudio", "vllm", "llamacpp"}
+LEGACY_PROVIDER_ALIASES = {
+    "lmstudio": "custom",
+    "vllm": "custom",
+    "llamacpp": "custom",
+    "codex": "openai-codex",
+}
+LOCAL_PROVIDER_IDS = frozenset({"custom", "ollama", "openai-codex"})
 PROVIDER_OPTIONS = [
     ("auto", "Auto"),
+    ("ollama", "Ollama (Local)"),
+    ("openai-codex", "OpenAI Codex (Local / CLI bridge)"),
     ("openrouter", "OpenRouter"),
     ("custom", "Ollama or other OpenAI-compatible endpoint"),
     ("anthropic", "Anthropic"),
@@ -65,6 +75,8 @@ class HermesSettings:
     default_model: str = ""
     ollama_base_url: str = ""
     ollama_api_key: str = ""
+    codex_base_url: str = ""
+    codex_api_key: str = ""
     openrouter_api_key: str = ""
 
 
@@ -104,6 +116,7 @@ def quote_env_value(value: str) -> str:
 
 def write_env_file(path: Path, values: dict[str, str]) -> None:
     """Persist env values in a stable order for readable diffs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"{key}={quote_env_value(value)}" for key, value in sorted(values.items())]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     try:
@@ -126,6 +139,7 @@ def read_config_file(path: Path = CONFIG_PATH) -> dict[str, Any]:
 
 def write_config_file(path: Path, config: dict[str, Any]) -> None:
     """Persist config.yaml while preserving predictable key ordering."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         yaml.safe_dump(config, sort_keys=False, allow_unicode=False),
         encoding="utf-8",
@@ -137,9 +151,15 @@ def write_config_file(path: Path, config: dict[str, Any]) -> None:
 
 
 def normalize_provider(value: str) -> str:
-    """Collapse Ollama aliases into the custom OpenAI-compatible mode."""
+    """Normalize legacy aliases while preserving explicit provider choices."""
     normalized = (value or "auto").strip().lower()
-    return "custom" if normalized in CUSTOM_PROVIDER_ALIASES else normalized or "auto"
+    return LEGACY_PROVIDER_ALIASES.get(normalized, normalized or "auto")
+
+
+def resolve_runtime_provider(value: str) -> str:
+    """Collapse local OpenAI-compatible providers to the shared runtime path."""
+    provider = normalize_provider(value)
+    return "custom" if provider in LOCAL_PROVIDER_IDS else provider
 
 
 def normalize_ollama_base_url(value: str) -> str:
@@ -187,8 +207,12 @@ def inferred_seed_provider(env_values: dict[str, str] | None = None) -> str:
     explicit = env_seed("HERMES_INFERENCE_PROVIDER")
     if explicit:
         return normalize_provider(explicit)
+    if persisted_env.get("CODEX_BASE_URL", "").strip() or env_seed("CODEX_BASE_URL"):
+        return "openai-codex"
+    if is_codex_cli_enabled("", persisted_env):
+        return "openai-codex"
     if persisted_env.get("OLLAMA_BASE_URL", "").strip() or env_seed("OLLAMA_BASE_URL"):
-        return "custom"
+        return "ollama"
     if persisted_env.get("OPENROUTER_API_KEY", "").strip() or env_seed(
         "OPENROUTER_API_KEY"
     ):
@@ -215,24 +239,40 @@ def load_settings() -> HermesSettings:
     saved_model = str(model.get("default") or model.get("model") or "").strip()
     active_base_url = str(model.get("base_url") or "").strip()
     saved_ollama_base = env_values.get("OLLAMA_BASE_URL", "").strip()
+    saved_codex_base = env_values.get("CODEX_BASE_URL", "").strip()
     # Older installs may have stored the effective custom endpoint in
     # config.yaml, so a non-OpenRouter base_url wins over the dotenv copy.
     if active_base_url and not is_openrouter_url(active_base_url):
-        saved_ollama_base = active_base_url
+        if saved_provider == "openai-codex":
+            saved_codex_base = active_base_url
+        else:
+            saved_ollama_base = active_base_url
 
     if env_exists:
         ollama_base_url = normalize_ollama_base_url(saved_ollama_base)
+        codex_base_url = normalize_ollama_base_url(saved_codex_base)
         ollama_api_key = env_values.get("OLLAMA_API_KEY", "").strip()
+        codex_api_key = env_values.get("CODEX_API_KEY", "").strip()
         if not ollama_api_key and active_base_url and not is_openrouter_url(active_base_url):
-            ollama_api_key = env_values.get("OPENAI_API_KEY", "").strip()
+            if saved_provider in {"custom", "ollama"}:
+                ollama_api_key = env_values.get("OPENAI_API_KEY", "").strip()
+            elif saved_provider == "openai-codex":
+                codex_api_key = env_values.get("OPENAI_API_KEY", "").strip()
         openrouter_api_key = env_values.get("OPENROUTER_API_KEY", "").strip()
     else:
         ollama_base_url = normalize_ollama_base_url(
             saved_ollama_base or env_seed("OLLAMA_BASE_URL")
         )
+        codex_base_url = normalize_ollama_base_url(
+            saved_codex_base or env_seed("CODEX_BASE_URL")
+        )
         ollama_api_key = env_seed("OLLAMA_API_KEY")
+        codex_api_key = env_seed("CODEX_API_KEY")
         if not ollama_api_key and active_base_url and not is_openrouter_url(active_base_url):
-            ollama_api_key = env_seed("OPENAI_API_KEY")
+            if saved_provider in {"custom", "ollama"}:
+                ollama_api_key = env_seed("OPENAI_API_KEY")
+            elif saved_provider == "openai-codex":
+                codex_api_key = env_seed("OPENAI_API_KEY")
         openrouter_api_key = env_seed("OPENROUTER_API_KEY")
 
     # Keep persisted values authoritative per file once that file exists.
@@ -252,6 +292,8 @@ def load_settings() -> HermesSettings:
         default_model=default_model,
         ollama_base_url=ollama_base_url,
         ollama_api_key=ollama_api_key,
+        codex_base_url=codex_base_url,
+        codex_api_key=codex_api_key,
         openrouter_api_key=openrouter_api_key,
     )
 
@@ -259,19 +301,33 @@ def load_settings() -> HermesSettings:
 def is_inference_ready(settings: HermesSettings) -> bool:
     """Check whether the current provider has enough data for a real launch."""
     provider = normalize_provider(settings.provider)
+    runtime_provider = resolve_runtime_provider(provider)
     env_values = read_env_file()
 
     if provider == "openrouter":
         return bool(settings.default_model and settings.openrouter_api_key)
-    if provider == "custom":
+    if provider in {"custom", "ollama"}:
         return bool(settings.default_model and settings.ollama_base_url)
+    if provider == "openai-codex":
+        return bool(
+            settings.default_model
+            and (
+                settings.codex_base_url
+                or codex_cli_ready(settings.codex_base_url, env_values)
+            )
+        )
     if provider == "auto":
         return bool(
             settings.default_model
-            and (settings.openrouter_api_key or settings.ollama_base_url)
+            and (
+                settings.openrouter_api_key
+                or settings.ollama_base_url
+                or settings.codex_base_url
+                or codex_cli_ready(settings.codex_base_url, env_values)
+            )
         )
 
-    required = PROVIDER_ENV_REQUIREMENTS.get(provider, ())
+    required = PROVIDER_ENV_REQUIREMENTS.get(runtime_provider, ())
     if not required:
         return False
     return bool(
@@ -290,7 +346,11 @@ def seed_files_from_env() -> None:
     if not CONFIG_PATH.exists() and (settings.default_model or settings.ollama_base_url):
         write_config_file(CONFIG_PATH, build_config_payload(settings, {}))
     if not ENV_PATH.exists() and (
-        settings.ollama_base_url or settings.ollama_api_key or settings.openrouter_api_key
+        settings.ollama_base_url
+        or settings.ollama_api_key
+        or settings.codex_base_url
+        or settings.codex_api_key
+        or settings.openrouter_api_key
     ):
         write_env_file(ENV_PATH, build_env_payload(settings, {}))
 
@@ -308,6 +368,7 @@ def build_config_payload(
         model = dict(model)
 
     provider = normalize_provider(settings.provider)
+    runtime_provider = resolve_runtime_provider(provider)
     model["provider"] = provider
     if settings.default_model:
         model["default"] = settings.default_model.strip()
@@ -315,8 +376,16 @@ def build_config_payload(
         model.pop("default", None)
         model.pop("model", None)
 
-    if provider == "custom" and settings.ollama_base_url:
-        model["base_url"] = normalize_ollama_base_url(settings.ollama_base_url)
+    if runtime_provider == "custom":
+        local_base_url = (
+            settings.codex_base_url
+            if provider == "openai-codex"
+            else settings.ollama_base_url
+        )
+        if local_base_url:
+            model["base_url"] = normalize_ollama_base_url(local_base_url)
+        else:
+            model.pop("base_url", None)
     elif provider == "openrouter":
         model["base_url"] = DEFAULT_OPENROUTER_BASE_URL
     else:
@@ -348,11 +417,20 @@ def build_env_payload(
 
     set_or_remove(env_values, "OLLAMA_BASE_URL", normalize_ollama_base_url(settings.ollama_base_url))
     set_or_remove(env_values, "OLLAMA_API_KEY", settings.ollama_api_key.strip())
+    set_or_remove(env_values, "CODEX_BASE_URL", normalize_ollama_base_url(settings.codex_base_url))
+    set_or_remove(env_values, "CODEX_API_KEY", settings.codex_api_key.strip())
     set_or_remove(env_values, "OPENROUTER_API_KEY", settings.openrouter_api_key.strip())
 
     # Only remove OPENAI_API_KEY when this admin flow created the mirror.
-    if settings.ollama_api_key.strip():
-        env_values["OPENAI_API_KEY"] = settings.ollama_api_key.strip()
+    active_openai_key = ""
+    provider = normalize_provider(settings.provider)
+    if provider in {"custom", "ollama"}:
+        active_openai_key = settings.ollama_api_key.strip()
+    elif provider == "openai-codex":
+        active_openai_key = settings.codex_api_key.strip()
+
+    if active_openai_key:
+        env_values["OPENAI_API_KEY"] = active_openai_key
         env_values[OPENAI_KEY_MARKER] = OPENAI_KEY_MARKER_VALUE
     elif env_values.get(OPENAI_KEY_MARKER) == OPENAI_KEY_MARKER_VALUE:
         env_values.pop("OPENAI_API_KEY", None)
@@ -368,6 +446,8 @@ def save_settings(payload: dict[str, Any]) -> HermesSettings:
         default_model=str(payload.get("default_model") or "").strip(),
         ollama_base_url=normalize_ollama_base_url(str(payload.get("ollama_base_url") or "")),
         ollama_api_key=str(payload.get("ollama_api_key") or "").strip(),
+        codex_base_url=normalize_ollama_base_url(str(payload.get("codex_base_url") or "")),
+        codex_api_key=str(payload.get("codex_api_key") or "").strip(),
         openrouter_api_key=str(payload.get("openrouter_api_key") or "").strip(),
     )
     write_config_file(CONFIG_PATH, build_config_payload(settings, read_config_file()))

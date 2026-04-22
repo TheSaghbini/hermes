@@ -17,12 +17,18 @@ import urllib.error
 import urllib.request
 from typing import Generator
 
+from codex_cli_bridge import (
+    is_codex_cli_base_url,
+    resolve_codex_cli_base_url,
+    stream_codex_cli_chat,
+)
 from hermes_config import (
     DEFAULT_OPENROUTER_BASE_URL,
     PROVIDER_ENV_REQUIREMENTS,
     HermesSettings,
     normalize_provider,
     read_env_file,
+    resolve_runtime_provider,
 )
 
 LOGGER = logging.getLogger("hermes-admin.chat")
@@ -52,9 +58,14 @@ def resolve_provider(settings: HermesSettings) -> tuple[str, str | None]:
     not need to handle env-file parsing.
     """
     provider = normalize_provider(settings.provider)
+    runtime_provider = resolve_runtime_provider(provider)
     env_values = read_env_file()
 
-    if provider == "custom":
+    if provider == "openai-codex":
+        key = settings.codex_api_key or None
+        return resolve_codex_cli_base_url(settings.codex_base_url, env_values), key
+
+    if runtime_provider == "custom":
         key = settings.ollama_api_key or None
         return settings.ollama_base_url, key
 
@@ -96,6 +107,9 @@ def stream_chat(
 
     @ai-mutates Nothing — pure network I/O and string generation.
     """
+    if is_codex_cli_base_url(base_url):
+        return (yield from stream_codex_cli_chat(api_key, model, messages))
+
     url = f"{base_url.rstrip('/')}/chat/completions"
     payload = json.dumps({
         "model": model,
