@@ -50,18 +50,19 @@ YAML
 chmod 600 "$HERMES_CONFIG"
 echo "[start] Wrote $HERMES_CONFIG with custom codex adapter provider"
 
-# ── First-boot: seed hermes-agent .env ────────────────────────────────────────
+# ── Always normalize hermes-agent .env ───────────────────────────────────────
+# Railway persists /data across deploys, so stale env from an older image can
+# keep API_SERVER_HOST=0.0.0.0 and block the API server unless API_SERVER_KEY
+# is set. Keep the API server bound to localhost inside this all-in-one image.
 HERMES_ENV="$HERMES_HOME/.env"
-if [ ! -f "$HERMES_ENV" ]; then
-  {
-    echo "API_SERVER_ENABLED=true"
-    echo "API_SERVER_HOST=0.0.0.0"
-    [ -n "${OPENAI_API_KEY:-}" ]  && printf 'OPENAI_API_KEY=%s\n'  "$OPENAI_API_KEY"
-    [ -n "${API_SERVER_KEY:-}" ]  && printf 'API_SERVER_KEY=%s\n'  "$API_SERVER_KEY"
-  } > "$HERMES_ENV"
-  chmod 600 "$HERMES_ENV"
-  echo "[start] Seeded $HERMES_ENV"
-fi
+{
+  echo "API_SERVER_ENABLED=true"
+  echo "API_SERVER_HOST=127.0.0.1"
+  [ -n "${OPENAI_API_KEY:-}" ]  && printf 'OPENAI_API_KEY=%s\n'  "$OPENAI_API_KEY"
+  [ -n "${API_SERVER_KEY:-}" ]  && printf 'API_SERVER_KEY=%s\n'  "$API_SERVER_KEY"
+} > "$HERMES_ENV"
+chmod 600 "$HERMES_ENV"
+echo "[start] Wrote $HERMES_ENV"
 
 # ── Service 1: Codex CLI adapter ──────────────────────────────────────────────
 echo "[start] Starting Codex CLI adapter on :8645 ..."

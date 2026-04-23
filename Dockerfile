@@ -43,7 +43,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CODEX_UNSAFE_ALLOW_NO_SANDBOX=1 \
     CODEX_CLI_SANDBOX=none \
     API_SERVER_ENABLED=true \
-    API_SERVER_HOST=0.0.0.0
+    API_SERVER_HOST=127.0.0.1
 
 # Route workspace UI through the full hermes-agent gateway (not the bare codex-adapter).
 # Separate ENV so inline comments don't confuse the multi-value continuation parser.
