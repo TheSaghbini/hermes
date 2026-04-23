@@ -50,7 +50,7 @@ WORKDIR /app
 # ── Install Node.js 22 + system utilities ─────────────────────────────────────
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl ca-certificates tini gnupg \
+        curl ca-certificates tini gnupg git \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
     && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
