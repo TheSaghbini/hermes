@@ -70,11 +70,6 @@ RUN pip install --no-cache-dir \
         "hermes-agent[messaging,cron] @ git+https://github.com/nousresearch/hermes-agent.git@${HERMES_REF}" \
     && pip install --no-cache-dir -r /tmp/adapter-requirements.txt
 
-# ── Create non-root user ──────────────────────────────────────────────────────
-RUN groupadd -r workspace \
-    && useradd -r -g workspace -u 10010 -m workspace \
-    && mkdir -p /data/.hermes /data/.hermes/.codex
-
 # ── Copy workspace build artefacts ───────────────────────────────────────────
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/node_modules ./node_modules
@@ -88,10 +83,11 @@ COPY codex_adapter/ ./codex_adapter/
 COPY codex_cli_bridge.py ./
 COPY start.sh ./
 
-RUN chmod +x /app/start.sh \
-    && chown -R workspace:workspace /app /data
+RUN chmod +x /app/start.sh
 
-USER workspace
+# Run as root so Railway volume mounts under /data are writable.
+# Railway mounts volumes as root-owned at container start, after Dockerfile
+# chown/mkdir steps would have run — so non-root users can never mkdir there.
 
 EXPOSE 3000
 
