@@ -1,11 +1,13 @@
 #!/bin/sh
 # Hermes all-in-one container entrypoint.
 #
-# Starts four processes:
-#   1. codex-adapter      — Codex CLI → OpenAI-compat API on :8645 (background)
-#   2. hermes-agent       — gateway on :8642 (background)
-#   3. hermes dashboard   — extended APIs (sessions/skills/config) on :9119 (background)
-#   4. hermes-workspace   — Node.js UI on $PORT (foreground / exec)
+# Starts three processes:
+#   1. codex-adapter    — Codex CLI → OpenAI-compat API on :8645 (background)
+#   2. hermes-agent     — full gateway on :8642 (background)
+#   3. hermes-workspace — Node.js UI on $PORT (foreground / exec)
+#
+# The workspace UI is pointed at hermes-agent (:8642) via workspace-overrides.json
+# so it uses sessions/skills/config/jobs in addition to chat.
 #
 # tini (PID 1) handles signal forwarding and zombie reaping.
 
@@ -19,6 +21,17 @@ export CODEX_HOME
 
 mkdir -p "$HERMES_HOME" "$CODEX_HOME"
 chmod 700 "$HERMES_HOME" "$CODEX_HOME" 2>/dev/null || true
+
+# ── Always seed workspace URL override (highest-priority) ───────────────────────
+# workspace-overrides.json takes precedence over HERMES_API_URL env var.
+# Without this the workspace auto-detects :8645 (codex-adapter) first and
+# skips hermes-agent's full API surface (sessions/skills/config/jobs).
+cat > "$HERMES_HOME/workspace-overrides.json" <<'JSON'
+{
+  "hermesApiUrl": "http://127.0.0.1:8642"
+}
+JSON
+chmod 600 "$HERMES_HOME/workspace-overrides.json"
 
 # ── First-boot: seed hermes-agent config.yaml ─────────────────────────────────
 HERMES_CONFIG="$HERMES_HOME/config.yaml"
@@ -58,15 +71,10 @@ echo "[start] Starting hermes-agent gateway on :8642 ..."
 hermes gateway run &
 GATEWAY_PID=$!
 
-# ── Service 3: hermes dashboard (extended APIs: sessions/skills/config) ────────
-echo "[start] Starting hermes dashboard on :9119 ..."
-hermes dashboard &
-DASHBOARD_PID=$!
-
 # Give background services a moment to bind before the workspace connects.
 sleep 2
 
-# ── Service 4: hermes-workspace (foreground) ──────────────────────────────────
+# ── Service 3: hermes-workspace (foreground) ──────────────────────────────────
 echo "[start] Starting hermes-workspace UI on :${PORT:-3000} ..."
 exec node /app/server-entry.js
 

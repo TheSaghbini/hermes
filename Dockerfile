@@ -41,13 +41,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HERMES_HOME=/data/.hermes \
     CODEX_HOME=/data/.hermes/.codex \
     CODEX_UNSAFE_ALLOW_NO_SANDBOX=1 \
-    # Disable bwrap sandbox — container runtimes block user-namespace creation
     CODEX_CLI_SANDBOX=none \
-    # tell hermes-agent the API server is always on in this image
     API_SERVER_ENABLED=true \
-    API_SERVER_HOST=0.0.0.0 \
-    # workspace UI: use hermes-agent full gateway, not codex-adapter directly
-    HERMES_API_URL=http://127.0.0.1:8642 \
+    API_SERVER_HOST=0.0.0.0
+
+# Route workspace UI through the full hermes-agent gateway (not the bare codex-adapter).
+# Separate ENV so inline comments don't confuse the multi-value continuation parser.
+ENV HERMES_API_URL=http://127.0.0.1:8642 \
     HERMES_DASHBOARD_URL=http://127.0.0.1:9119
 
 WORKDIR /app
