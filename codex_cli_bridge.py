@@ -24,7 +24,9 @@ LOGGER = logging.getLogger("hermes-admin.codex-cli")
 CODEX_CLI_BASE_URL = "cli://local/v1"
 DEFAULT_CODEX_CLI_BIN = "codex"
 DEFAULT_CODEX_APPROVAL_MODE = "never"
-DEFAULT_CODEX_SANDBOX = "read-only"
+# Railway (and most container runtimes) block bwrap / user-namespace creation,
+# so read-only sandbox is not usable by default. Override via CODEX_CLI_SANDBOX.
+DEFAULT_CODEX_SANDBOX = "none"
 DEFAULT_CODEX_HOME_DIRNAME = ".codex"
 
 
