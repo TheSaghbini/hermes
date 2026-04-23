@@ -33,20 +33,20 @@ cat > "$HERMES_HOME/workspace-overrides.json" <<'JSON'
 JSON
 chmod 600 "$HERMES_HOME/workspace-overrides.json"
 
-# ── First-boot: seed hermes-agent config.yaml ─────────────────────────────────
+# ── Always normalize hermes-agent config.yaml ────────────────────────────────
+# Railway persists /data across deploys, so stale config from earlier boots can
+# pin Hermes to openai-codex. Force the primary model back to our local adapter.
 HERMES_CONFIG="$HERMES_HOME/config.yaml"
-if [ ! -f "$HERMES_CONFIG" ]; then
-  cat > "$HERMES_CONFIG" <<'YAML'
-provider: codex-local
-model: codex-cli
-custom_providers:
-  - name: codex-local
-    base_url: http://127.0.0.1:8645/v1
-    api_key: local
-    api_mode: chat_completions
+cat > "$HERMES_CONFIG" <<'YAML'
+model:
+  provider: custom
+  default: codex-cli
+  base_url: http://127.0.0.1:8645/v1
+  api_key: local
+  timeout: 600
 YAML
-  echo "[start] Seeded $HERMES_CONFIG with codex-local provider"
-fi
+chmod 600 "$HERMES_CONFIG"
+echo "[start] Wrote $HERMES_CONFIG with custom codex adapter provider"
 
 # ── First-boot: seed hermes-agent .env ────────────────────────────────────────
 HERMES_ENV="$HERMES_HOME/.env"
