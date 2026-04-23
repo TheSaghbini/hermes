@@ -1,10 +1,11 @@
 #!/bin/sh
 # Hermes all-in-one container entrypoint.
 #
-# Starts three processes:
+# Starts four processes:
 #   1. codex-adapter    — Codex CLI → OpenAI-compat API on :8645 (background)
 #   2. hermes-agent     — full gateway on :8642 (background)
-#   3. hermes-workspace — Node.js UI on $PORT (foreground / exec)
+#   3. hermes dashboard — sessions/skills/config UI API on :9119 (background)
+#   4. hermes-workspace — Node.js UI on $PORT (foreground / exec)
 #
 # The workspace UI is pointed at hermes-agent (:8642) via workspace-overrides.json
 # so it uses sessions/skills/config/jobs in addition to chat.
@@ -28,7 +29,8 @@ chmod 700 "$HERMES_HOME" "$CODEX_HOME" 2>/dev/null || true
 # skips hermes-agent's full API surface (sessions/skills/config/jobs).
 cat > "$HERMES_HOME/workspace-overrides.json" <<'JSON'
 {
-  "hermesApiUrl": "http://127.0.0.1:8642"
+  "hermesApiUrl": "http://127.0.0.1:8642",
+  "hermesDashboardUrl": "http://127.0.0.1:9119"
 }
 JSON
 chmod 600 "$HERMES_HOME/workspace-overrides.json"
@@ -71,10 +73,19 @@ echo "[start] Starting hermes-agent gateway on :8642 ..."
 hermes gateway run &
 GATEWAY_PID=$!
 
+# ── Service 3: hermes dashboard ───────────────────────────────────────────────
+echo "[start] Starting hermes dashboard on :9119 ..."
+python - <<'PY' &
+from hermes_cli.web_server import start_server
+
+start_server(host="127.0.0.1", port=9119, open_browser=False)
+PY
+DASHBOARD_PID=$!
+
 # Give background services a moment to bind before the workspace connects.
 sleep 2
 
-# ── Service 3: hermes-workspace (foreground) ──────────────────────────────────
+# ── Service 4: hermes-workspace (foreground) ──────────────────────────────────
 echo "[start] Starting hermes-workspace UI on :${PORT:-3000} ..."
 exec node /app/server-entry.js
 

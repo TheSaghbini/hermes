@@ -32,7 +32,7 @@ RUN pnpm build
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-ARG HERMES_REF=v2026.4.8
+ARG HERMES_REF=v2026.4.16
 ARG CODEX_NPM_PACKAGE=@openai/codex@latest
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -48,7 +48,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Route workspace UI through the full hermes-agent gateway (not the bare codex-adapter).
 # Separate ENV so inline comments don't confuse the multi-value continuation parser.
 ENV HERMES_API_URL=http://127.0.0.1:8642 \
-    HERMES_DASHBOARD_URL=http://127.0.0.1:9119
+    HERMES_DASHBOARD_URL=http://127.0.0.1:9119 \
+    HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist \
+    GATEWAY_HEALTH_URL=http://127.0.0.1:8642/health/detailed
 
 WORKDIR /app
 
@@ -72,7 +74,12 @@ RUN npm install --global "$CODEX_NPM_PACKAGE" \
 # ── Install hermes-agent + codex-adapter Python deps ─────────────────────────
 COPY codex_adapter/requirements.txt /tmp/adapter-requirements.txt
 RUN pip install --no-cache-dir \
-        "hermes-agent[messaging,cron] @ git+https://github.com/nousresearch/hermes-agent.git@${HERMES_REF}" \
+        git+https://github.com/nousresearch/hermes-agent.git@${HERMES_REF} \
+    && git clone --depth 1 --branch "${HERMES_REF}" https://github.com/nousresearch/hermes-agent.git /opt/hermes-agent \
+    && cd /opt/hermes-agent/web \
+    && npm install --silent \
+    && npm run build \
+    && pip install --no-cache-dir -e "/opt/hermes-agent[web,messaging,cron]" \
     && pip install --no-cache-dir -r /tmp/adapter-requirements.txt
 
 # ── Copy workspace build artefacts ───────────────────────────────────────────
