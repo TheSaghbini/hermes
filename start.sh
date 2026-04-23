@@ -1,10 +1,11 @@
 #!/bin/sh
 # Hermes all-in-one container entrypoint.
 #
-# Starts three processes:
-#   1. codex-adapter  — Codex CLI → OpenAI-compat API on :8645 (background)
-#   2. hermes-agent   — gateway on :8642 (background)
-#   3. hermes-workspace — Node.js UI on $PORT (foreground / exec)
+# Starts four processes:
+#   1. codex-adapter      — Codex CLI → OpenAI-compat API on :8645 (background)
+#   2. hermes-agent       — gateway on :8642 (background)
+#   3. hermes dashboard   — extended APIs (sessions/skills/config) on :9119 (background)
+#   4. hermes-workspace   — Node.js UI on $PORT (foreground / exec)
 #
 # tini (PID 1) handles signal forwarding and zombie reaping.
 
@@ -57,11 +58,15 @@ echo "[start] Starting hermes-agent gateway on :8642 ..."
 hermes gateway run &
 GATEWAY_PID=$!
 
-# Give the adapter a moment to bind before the workspace tries to reach the
-# gateway (which in turn reaches the adapter on first chat).
+# ── Service 3: hermes dashboard (extended APIs: sessions/skills/config) ────────
+echo "[start] Starting hermes dashboard on :9119 ..."
+hermes dashboard &
+DASHBOARD_PID=$!
+
+# Give background services a moment to bind before the workspace connects.
 sleep 2
 
-# ── Service 3: hermes-workspace (foreground) ──────────────────────────────────
+# ── Service 4: hermes-workspace (foreground) ──────────────────────────────────
 echo "[start] Starting hermes-workspace UI on :${PORT:-3000} ..."
 exec node /app/server-entry.js
 
