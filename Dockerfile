@@ -32,7 +32,7 @@ RUN pnpm build
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-ARG HERMES_REF=v2026.4.16
+ARG HERMES_REF=v2026.4.23
 ARG CODEX_NPM_PACKAGE=@openai/codex@latest
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -43,7 +43,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CODEX_UNSAFE_ALLOW_NO_SANDBOX=1 \
     CODEX_CLI_SANDBOX=none \
     API_SERVER_ENABLED=true \
-    API_SERVER_HOST=127.0.0.1
+    API_SERVER_HOST=127.0.0.1 \
+    DISCORD_COMMAND_SYNC_POLICY=safe
 
 # Route workspace core chat/models traffic to the OpenAI-compatible codex adapter.
 # Enhanced APIs (sessions, skills, config, jobs) are served separately by the dashboard.
