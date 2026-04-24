@@ -111,4 +111,34 @@ done
 
 # ── Service 4: hermes-workspace (foreground) ──────────────────────────────────
 echo "[start] Starting hermes-workspace UI on :${PORT:-3000} ..."
-exec node /app/server-entry.js
+node /app/server-entry.js &
+WORKSPACE_PID=$!
+
+terminate() {
+  echo "[start] Shutting down services ..."
+  kill "$WORKSPACE_PID" "$DASHBOARD_PID" "$GATEWAY_PID" "$ADAPTER_PID" 2>/dev/null || true
+  wait "$WORKSPACE_PID" "$DASHBOARD_PID" "$GATEWAY_PID" "$ADAPTER_PID" 2>/dev/null || true
+}
+
+trap 'terminate; exit 0' INT TERM
+
+# Railway only health-checks the public workspace port. Keep supervising the
+# private services too; if any one dies, exit so Railway restarts the container
+# instead of leaving the UI up but disconnected from the backend.
+while :; do
+  for pid_name in \
+    "$ADAPTER_PID:codex-adapter" \
+    "$GATEWAY_PID:hermes-gateway" \
+    "$DASHBOARD_PID:hermes-dashboard" \
+    "$WORKSPACE_PID:hermes-workspace"
+  do
+    pid=${pid_name%%:*}
+    name=${pid_name#*:}
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[start] ERROR: $name exited; terminating container so Railway can restart it"
+      terminate
+      exit 1
+    fi
+  done
+  sleep 2
+done
