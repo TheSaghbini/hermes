@@ -7,8 +7,8 @@
 #   3. hermes dashboard — sessions/skills/config UI API on :9119 (background)
 #   4. hermes-workspace — Node.js UI on $PORT (foreground / exec)
 #
-# The workspace UI is pointed at hermes-agent (:8642) via workspace-overrides.json
-# so it uses sessions/skills/config/jobs in addition to chat.
+# The workspace UI is pointed at the codex-adapter for core chat/model APIs and
+# at the Hermes dashboard for sessions/skills/config/jobs.
 #
 # tini (PID 1) handles signal forwarding and zombie reaping.
 
@@ -25,11 +25,11 @@ chmod 700 "$HERMES_HOME" "$CODEX_HOME" 2>/dev/null || true
 
 # ── Always seed workspace URL override (highest-priority) ───────────────────────
 # workspace-overrides.json takes precedence over HERMES_API_URL env var.
-# Without this the workspace auto-detects :8645 (codex-adapter) first and
-# skips hermes-agent's full API surface (sessions/skills/config/jobs).
+# In the split zero-fork setup, :8645 serves the OpenAI-compatible chat/model
+# APIs while :9119 serves the enhanced Hermes dashboard APIs.
 cat > "$HERMES_HOME/workspace-overrides.json" <<'JSON'
 {
-  "hermesApiUrl": "http://127.0.0.1:8642",
+  "hermesApiUrl": "http://127.0.0.1:8645",
   "hermesDashboardUrl": "http://127.0.0.1:9119"
 }
 JSON

@@ -45,9 +45,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     API_SERVER_ENABLED=true \
     API_SERVER_HOST=127.0.0.1
 
-# Route workspace UI through the full hermes-agent gateway (not the bare codex-adapter).
-# Separate ENV so inline comments don't confuse the multi-value continuation parser.
-ENV HERMES_API_URL=http://127.0.0.1:8642 \
+# Route workspace core chat/models traffic to the OpenAI-compatible codex adapter.
+# Enhanced APIs (sessions, skills, config, jobs) are served separately by the dashboard.
+ENV HERMES_API_URL=http://127.0.0.1:8645 \
     HERMES_DASHBOARD_URL=http://127.0.0.1:9119 \
     HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist \
     GATEWAY_HEALTH_URL=http://127.0.0.1:8642/health/detailed
