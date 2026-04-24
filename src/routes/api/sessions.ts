@@ -101,7 +101,7 @@ export const Route = createFileRoute('/api/sessions')({
             typeof body.model === 'string' ? body.model.trim() : ''
           const model = requestedModel || undefined
 
-          if (capabilities.dashboard.available && !capabilities.enhancedChat) {
+          if (capabilities.dashboard.available) {
             return json({
               ok: true,
               sessionKey: friendlyId,

@@ -336,20 +336,272 @@ type StreamChatOptions = {
   onEvent: (payload: { event: string; data: Record<string, unknown> }) => void
 }
 
+let preferRunsChat = false
+
+function readString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+async function* readSseJsonEvents(
+  response: Response,
+): AsyncGenerator<{ event: string; data: Record<string, unknown> }, void, void> {
+  const reader = response.body?.getReader()
+  if (!reader) throw new Error('No response body')
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    let boundary = buffer.indexOf('\n\n')
+    while (boundary >= 0) {
+      const rawEvent = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+
+      let eventName = ''
+      const dataLines: Array<string> = []
+      for (const line of rawEvent.split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith(':')) continue
+        if (trimmed.startsWith('event:')) {
+          eventName = trimmed.slice(6).trim()
+          continue
+        }
+        if (trimmed.startsWith('data:')) {
+          dataLines.push(trimmed.slice(5).trim())
+        }
+      }
+
+      for (const dataLine of dataLines) {
+        if (!dataLine || dataLine === '[DONE]') continue
+        try {
+          const data = JSON.parse(dataLine) as Record<string, unknown>
+          yield {
+            event: eventName || readString(data.event) || 'message',
+            data,
+          }
+        } catch {
+          // skip malformed JSON
+        }
+      }
+
+      boundary = buffer.indexOf('\n\n')
+    }
+  }
+}
+
+type RunsChatBody = {
+  message: string
+  model?: string
+  system_message?: string
+  attachments?: Array<Record<string, unknown>>
+  conversation_history?: Array<{ role: string; content: string }>
+}
+
+function buildRunsPayload(sessionId: string, body: RunsChatBody) {
+  return {
+    model: body.model,
+    session_id: sessionId,
+    instructions: body.system_message,
+    conversation_history: body.conversation_history,
+    input: [{ role: 'user', content: body.message }],
+  }
+}
+
+function normalizeRunToolEvent(
+  data: Record<string, unknown>,
+): Record<string, unknown> {
+  const toolName = readString(data.tool) || readString(data.name) || 'tool'
+  return {
+    ...data,
+    name: toolName,
+    tool_name: toolName,
+    result: data.result ?? data.output,
+  }
+}
+
+async function createRun(
+  sessionId: string,
+  body: RunsChatBody,
+  signal?: AbortSignal,
+): Promise<string> {
+  const res = await fetch(`${HERMES_API}/v1/runs`, {
+    method: 'POST',
+    headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(buildRunsPayload(sessionId, body)),
+    signal,
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`Hermes runs API: ${res.status} ${text}`)
+  }
+  const payload = (await res.json()) as Record<string, unknown>
+  const runId = readString(payload.run_id)
+  if (!runId) throw new Error('Hermes runs API did not return run_id')
+  return runId
+}
+
+async function streamRunsChat(
+  sessionId: string,
+  body: RunsChatBody,
+  opts: StreamChatOptions,
+): Promise<void> {
+  const runId = await createRun(sessionId, body, opts.signal)
+  opts.onEvent({
+    event: 'run.started',
+    data: {
+      run_id: runId,
+      session_id: sessionId,
+      user_message: {
+        id: `${runId}:user`,
+        role: 'user',
+        content: body.message,
+      },
+    },
+  })
+
+  const res = await fetch(
+    `${HERMES_API}/v1/runs/${encodeURIComponent(runId)}/events`,
+    {
+      headers: _authHeaders(),
+      signal: opts.signal,
+    },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`Hermes run events: ${res.status} ${text}`)
+  }
+
+  for await (const { event, data } of readSseJsonEvents(res)) {
+    const eventRunId = readString(data.run_id) || runId
+    const withSession = {
+      ...data,
+      run_id: eventRunId,
+      session_id: sessionId,
+    }
+
+    if (event === 'message.delta') {
+      opts.onEvent({
+        event: 'assistant.delta',
+        data: {
+          ...withSession,
+          delta: readString(data.delta),
+        },
+      })
+      continue
+    }
+
+    if (event === 'tool.started') {
+      opts.onEvent({
+        event: 'tool.started',
+        data: normalizeRunToolEvent(withSession),
+      })
+      continue
+    }
+
+    if (event === 'tool.completed') {
+      opts.onEvent({
+        event: 'tool.completed',
+        data: normalizeRunToolEvent(withSession),
+      })
+      continue
+    }
+
+    if (event === 'reasoning.available') {
+      opts.onEvent({
+        event: 'tool.progress',
+        data: {
+          ...withSession,
+          tool_name: '_thinking',
+          name: '_thinking',
+          delta: readString(data.text),
+        },
+      })
+      continue
+    }
+
+    if (event === 'run.completed') {
+      const content = readString(data.output)
+      if (content) {
+        opts.onEvent({
+          event: 'assistant.completed',
+          data: {
+            ...withSession,
+            content,
+          },
+        })
+      }
+      opts.onEvent({
+        event: 'run.completed',
+        data: withSession,
+      })
+      continue
+    }
+
+    if (event === 'run.failed') {
+      opts.onEvent({
+        event: 'error',
+        data: {
+          ...withSession,
+          message: readString(data.error) || 'Hermes run failed',
+        },
+      })
+      continue
+    }
+
+    opts.onEvent({ event, data: withSession })
+  }
+}
+
+async function sendRunsChat(
+  sessionId: string,
+  body: RunsChatBody,
+): Promise<Record<string, unknown>> {
+  const runId = await createRun(sessionId, body)
+  const res = await fetch(
+    `${HERMES_API}/v1/runs/${encodeURIComponent(runId)}/events`,
+    { headers: _authHeaders() },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`Hermes run events: ${res.status} ${text}`)
+  }
+
+  let output = ''
+  for await (const { event, data } of readSseJsonEvents(res)) {
+    if (event === 'run.completed') {
+      output = readString(data.output)
+      break
+    }
+    if (event === 'run.failed') {
+      throw new Error(readString(data.error) || 'Hermes run failed')
+    }
+  }
+
+  return {
+    ok: true,
+    run_id: runId,
+    session_id: sessionId,
+    content: output,
+  }
+}
+
 /**
  * Send a chat message and stream SSE events from Hermes FastAPI.
  * Returns a promise that resolves when the stream ends.
  */
 export async function streamChat(
   sessionId: string,
-  body: {
-    message: string
-    model?: string
-    system_message?: string
-    attachments?: Array<Record<string, unknown>>
-  },
+  body: RunsChatBody,
   opts: StreamChatOptions,
 ): Promise<void> {
+  if (preferRunsChat) {
+    return streamRunsChat(sessionId, body, opts)
+  }
+
   const res = await fetch(
     `${HERMES_API}/api/sessions/${sessionId}/chat/stream`,
     {
@@ -361,6 +613,10 @@ export async function streamChat(
   )
 
   if (!res.ok) {
+    if (res.status === 404 || res.status === 405) {
+      preferRunsChat = true
+      return streamRunsChat(sessionId, body, opts)
+    }
     const text = await res.text().catch(() => '')
     throw new Error(`Hermes chat stream: ${res.status} ${text}`)
   }
@@ -406,10 +662,25 @@ export async function sendChat(
   const msg =
     typeof messageOrOpts === 'string' ? messageOrOpts : messageOrOpts.message
   const mdl = typeof messageOrOpts === 'string' ? model : messageOrOpts.model
-  return hermesPost(`/api/sessions/${sessionId}/chat`, {
-    message: msg,
-    model: mdl,
+
+  const res = await fetch(`${HERMES_API}/api/sessions/${sessionId}/chat`, {
+    method: 'POST',
+    headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message: msg,
+      model: mdl,
+    }),
   })
+  if (res.ok) return res.json() as Promise<Record<string, unknown>>
+  if (res.status === 404 || res.status === 405) {
+    preferRunsChat = true
+    return sendRunsChat(sessionId, {
+      message: msg,
+      model: mdl,
+    })
+  }
+  const text = await res.text().catch(() => '')
+  throw new Error(`Hermes API /api/sessions/${sessionId}/chat: ${res.status} ${text}`)
 }
 
 // ── Memory ───────────────────────────────────────────────────────

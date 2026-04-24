@@ -583,6 +583,9 @@ export const Route = createFileRoute('/api/send-stream')({
                 if (reused) {
                   sessionKey = reused
                   resolvedFriendlyId = reused
+                } else if (getGatewayCapabilities().dashboard.available) {
+                  sessionKey = crypto.randomUUID()
+                  resolvedFriendlyId = sessionKey
                 } else {
                   const session = await createSession()
                   sessionKey = session.id
@@ -603,6 +606,7 @@ export const Route = createFileRoute('/api/send-stream')({
                     typeof body.model === 'string' ? body.model : undefined,
                   system_message: thinking,
                   attachments: attachments || undefined,
+                  conversation_history: history,
                 },
                 {
                   signal: abortController.signal,

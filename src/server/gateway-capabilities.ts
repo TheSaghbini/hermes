@@ -483,7 +483,8 @@ export async function probeGateway(options?: {
       chatCompletions,
       models,
       legacySessions,
-      enhancedChat,
+      legacyEnhancedChat,
+      runsApi,
       legacySkills,
       legacyConfig,
       legacyJobs,
@@ -494,6 +495,7 @@ export async function probeGateway(options?: {
       probe('/v1/models'),
       probe('/api/sessions'),
       probe('/api/sessions/__probe__/chat/stream'),
+      probe('/v1/runs'),
       probe('/api/skills'),
       probe('/api/config'),
       probe('/api/jobs'),
@@ -507,7 +509,7 @@ export async function probeGateway(options?: {
       streaming: chatCompletions,
       probed: true,
       sessions: dashboard.available || legacySessions,
-      enhancedChat,
+      enhancedChat: legacyEnhancedChat || runsApi,
       skills: dashboard.available || legacySkills,
       // Memory is always available: workspace reads $HERMES_HOME/MEMORY.md +
       // memory/*.md + memories/*.md directly from the local filesystem.

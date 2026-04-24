@@ -19,17 +19,21 @@ set -eu
 
 export HERMES_HOME
 export CODEX_HOME
+if [ -z "${HERMES_API_TOKEN:-}" ] && [ -n "${API_SERVER_KEY:-}" ]; then
+  export HERMES_API_TOKEN="$API_SERVER_KEY"
+fi
 
 mkdir -p "$HERMES_HOME" "$CODEX_HOME"
 chmod 700 "$HERMES_HOME" "$CODEX_HOME" 2>/dev/null || true
 
 # ── Always seed workspace URL override (highest-priority) ───────────────────────
 # workspace-overrides.json takes precedence over HERMES_API_URL env var.
-# In the split zero-fork setup, :8645 serves the OpenAI-compatible chat/model
-# APIs while :9119 serves the enhanced Hermes dashboard APIs.
+# In the split zero-fork setup, :8642 serves the hermes-agent API server,
+# :8645 serves the Codex model adapter behind hermes-agent, and :9119 serves
+# the Hermes dashboard APIs.
 cat > "$HERMES_HOME/workspace-overrides.json" <<'JSON'
 {
-  "hermesApiUrl": "http://127.0.0.1:8645",
+  "hermesApiUrl": "http://127.0.0.1:8642",
   "hermesDashboardUrl": "http://127.0.0.1:9119"
 }
 JSON
@@ -58,6 +62,7 @@ HERMES_ENV="$HERMES_HOME/.env"
 {
   echo "API_SERVER_ENABLED=true"
   echo "API_SERVER_HOST=127.0.0.1"
+  echo "API_SERVER_MODEL_NAME=codex-cli"
   [ -n "${OPENAI_API_KEY:-}" ]  && printf 'OPENAI_API_KEY=%s\n'  "$OPENAI_API_KEY"
   [ -n "${API_SERVER_KEY:-}" ]  && printf 'API_SERVER_KEY=%s\n'  "$API_SERVER_KEY"
 } > "$HERMES_ENV"
@@ -89,4 +94,3 @@ sleep 2
 # ── Service 4: hermes-workspace (foreground) ──────────────────────────────────
 echo "[start] Starting hermes-workspace UI on :${PORT:-3000} ..."
 exec node /app/server-entry.js
-
