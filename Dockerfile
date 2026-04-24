@@ -44,7 +44,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CODEX_CLI_SANDBOX=none \
     API_SERVER_ENABLED=true \
     API_SERVER_HOST=127.0.0.1 \
-    DISCORD_COMMAND_SYNC_POLICY=safe
+    DISCORD_COMMAND_SYNC_POLICY=off
 
 # Route workspace core chat/models traffic to the OpenAI-compatible codex adapter.
 # Enhanced APIs (sessions, skills, config, jobs) are served separately by the dashboard.
