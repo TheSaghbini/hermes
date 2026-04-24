@@ -19,6 +19,14 @@ set -eu
 
 export HERMES_HOME
 export CODEX_HOME
+: "${DISCORD_COMMAND_SYNC_POLICY:=off}"
+API_SERVER_ENABLED=true
+API_SERVER_HOST=127.0.0.1
+API_SERVER_MODEL_NAME=codex-cli
+export API_SERVER_ENABLED
+export API_SERVER_HOST
+export API_SERVER_MODEL_NAME
+export DISCORD_COMMAND_SYNC_POLICY
 if [ -z "${HERMES_API_TOKEN:-}" ] && [ -n "${API_SERVER_KEY:-}" ]; then
   export HERMES_API_TOKEN="$API_SERVER_KEY"
 fi
@@ -60,9 +68,10 @@ echo "[start] Wrote $HERMES_CONFIG with custom codex adapter provider"
 # is set. Keep the API server bound to localhost inside this all-in-one image.
 HERMES_ENV="$HERMES_HOME/.env"
 {
-  echo "API_SERVER_ENABLED=true"
-  echo "API_SERVER_HOST=127.0.0.1"
-  echo "API_SERVER_MODEL_NAME=codex-cli"
+  printf 'API_SERVER_ENABLED=%s\n' "$API_SERVER_ENABLED"
+  printf 'API_SERVER_HOST=%s\n' "$API_SERVER_HOST"
+  printf 'API_SERVER_MODEL_NAME=%s\n' "$API_SERVER_MODEL_NAME"
+  printf 'DISCORD_COMMAND_SYNC_POLICY=%s\n' "$DISCORD_COMMAND_SYNC_POLICY"
   [ -n "${OPENAI_API_KEY:-}" ]  && printf 'OPENAI_API_KEY=%s\n'  "$OPENAI_API_KEY"
   [ -n "${API_SERVER_KEY:-}" ]  && printf 'API_SERVER_KEY=%s\n'  "$API_SERVER_KEY"
 } > "$HERMES_ENV"
@@ -89,7 +98,16 @@ PY
 DASHBOARD_PID=$!
 
 # Give background services a moment to bind before the workspace connects.
-sleep 2
+echo "[start] Waiting for hermes-agent API server on :8642 ..."
+attempt=0
+until curl -fsS --connect-timeout 1 --max-time 1 http://127.0.0.1:8642/health >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge "${HERMES_API_WAIT_ATTEMPTS:-45}" ]; then
+    echo "[start] WARNING: hermes-agent API server did not become ready; starting workspace anyway"
+    break
+  fi
+  sleep 1
+done
 
 # ── Service 4: hermes-workspace (foreground) ──────────────────────────────────
 echo "[start] Starting hermes-workspace UI on :${PORT:-3000} ..."
